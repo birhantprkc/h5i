@@ -429,9 +429,23 @@ a {
 .srow:hover {
   background: var(--hover);
 }
+/* The selection bar on a full-width row is a pseudo-element, not
+   `box-shadow: inset`. An inset shadow that covers a whole 256px wide tile
+   paints it white; crates/h5i-browser/tests/paint.rs holds the mechanism. Only
+   the rows wide enough to cover one need this: the rail, the chips and the
+   grid's first column are narrower than a tile and keep the shadow. These two
+   have no border-radius, so the pseudo-element is the same pixels. */
 .srow.is-on {
   background: var(--raised);
-  box-shadow: inset 2px 0 0 var(--accent);
+}
+.srow.is-on::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
 }
 .srow.is-stub {
   color: var(--ink-2);
@@ -1710,9 +1724,20 @@ tr.is-refused .path-dir {
 .fleet-row:hover {
   background: var(--hover);
 }
+.fleet-row {
+  position: relative;
+}
 .fleet-row.is-on {
   background: var(--raised);
-  box-shadow: inset 2px 0 0 var(--accent);
+}
+.fleet-row.is-on::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
 }
 .fleet-top {
   display: flex;
@@ -2305,3 +2330,77 @@ pre.render {
   margin-bottom: 0;
 }
 
+
+/* The request and response pane. Credential rows are tinted so a masked value
+   is visible as a decision rather than as an odd string. */
+.msg {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.msg-reveal {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.msg-half {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  padding: 8px 10px;
+}
+
+.msg-headers {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  margin-bottom: 8px;
+}
+
+.msg-headers th {
+  text-align: left;
+  font-weight: 400;
+  color: var(--ink-3);
+  padding: 1px 10px 1px 0;
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.msg-headers td {
+  color: var(--ink-2);
+  padding: 1px 0;
+  word-break: break-all;
+}
+
+.msg-headers tr.is-masked th,
+.msg-headers tr.is-masked td {
+  color: var(--amber);
+}
+
+.msg-body {
+  margin: 0;
+  max-height: 420px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 4px;
+  background: var(--ground);
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* A project's own session list: rows inside the body, not a column of them. */
+.plist {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.plist .srow:last-child {
+  border-bottom: none;
+}
