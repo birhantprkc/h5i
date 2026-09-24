@@ -352,6 +352,24 @@
     for (const el of found) prepareInsertedScript(el);
   }
 
+  /// Run `code` as `el`'s script, with `document.currentScript` naming `el`.
+  /// The parser-time path on the Rust side already does this; without it here,
+  /// a loader that injects its own tags read null and could not find itself.
+  /// Restored rather than nulled, because a script can insert a script.
+  function evalAsScript(el, code, name) {
+    const outer = globalThis.__h5iCurrentScript;
+    globalThis.__h5iCurrentScript = el._id;
+    try {
+      // As a script, not through `eval`: a top-level `let` belongs to the
+      // global scope every later script shares, and an `eval` would keep it to
+      // itself and drop it. A loader that splits declarations across chunks
+      // found the next chunk's names simply gone.
+      api.runScript(code, name || "");
+    } finally {
+      globalThis.__h5iCurrentScript = outer;
+    }
+  }
+
   function prepareInsertedScript(el) {
     if (el.__h5iScriptStarted || !el.isConnected) return;
     const kind = scriptKindOf(el);
@@ -374,7 +392,7 @@
           return response.text();
         })
         .then((code) => {
-          if (kind === "classic") (0, eval)(code);
+          if (kind === "classic") evalAsScript(el, code, el._resolved("src"));
           el.dispatchEvent(new Event("load"));
         })
         .catch(() => el.dispatchEvent(new Event("error")));
@@ -385,7 +403,7 @@
     if (kind !== "classic") return;
     el.__h5iScriptStarted = true;
     try {
-      (0, eval)(code);
+      evalAsScript(el, code);
     } catch (error) {
       console.error(`inserted script threw: ${withStack(error)}`);
     }
@@ -622,7 +640,10 @@
         // `then` is probed by the promise machinery on anything it is handed;
         // recording it would report a missing API every time a node passed
         // through an await.
-        if (property === "then") return undefined;
+        // `toJSON` is the same: `JSON.stringify` asks every object it walks for
+        // one, and a DOM node has none in any browser. Reporting it named a gap
+        // that no engine fills.
+        if (property === "then" || property === "toJSON") return undefined;
 
         // Nor is a page's own bookkeeping. No web platform property begins with
         // an underscore or a dollar; frameworks' private fields routinely do.
@@ -1041,7 +1062,10 @@
     /// four hand-picked corpora used it and everything in the DOM test suite
     /// does — which is the argument for running a conformance suite in one
     /// sentence.
-    hasChildNodes() { return api.children(this._id).length > 0; }
+    hasChildNodes() {
+      if (this.tagName === "TEMPLATE") return false;
+      return api.childCount(this._id) > 0;
+    }
 
     /// Same type, same name, same attributes, same children — not the same node.
     isEqualNode(other) {
@@ -1100,8 +1124,17 @@
       }
       return seenA < seenB ? FOLLOWING : PRECEDING;
     }
-    get firstChild() { return this.childNodes[0] || null; }
-    get lastChild() { const c = this.childNodes; return c[c.length - 1] || null; }
+    // One child, asked for by position: reading `childNodes` here wrapped every
+    // sibling to return one of them. The `<template>` rule still applies, so
+    // both go through the same guard the list does.
+    get firstChild() {
+      if (this.tagName === "TEMPLATE") return null;
+      return wrap(api.childAt(this._id, 0));
+    }
+    get lastChild() {
+      if (this.tagName === "TEMPLATE") return null;
+      return wrap(api.childAt(this._id, -1));
+    }
 
     // Text for a text node, null for an element — the distinction is the whole
     // reason the property exists, and code that walks a tree branches on it.
@@ -1315,16 +1348,11 @@
       return this.lookupNamespaceURI(null) === ns;
     }
 
-    get nextSibling() {
-      const kids = this.parentNode ? this.parentNode.childNodes : [];
-      const at = kids.findIndex((n) => n._id === this._id);
-      return at >= 0 ? kids[at + 1] || null : null;
-    }
-    get previousSibling() {
-      const kids = this.parentNode ? this.parentNode.childNodes : [];
-      const at = kids.findIndex((n) => n._id === this._id);
-      return at > 0 ? kids[at - 1] : null;
-    }
+    // The position is found in the host, not here. Reading `childNodes` to find
+    // this node in it meant building the parent's whole list and wrapping every
+    // node in it per step, so walking N siblings cost N arrays and N² wrappers.
+    get nextSibling() { return wrap(api.siblingOf(this._id, 1)); }
+    get previousSibling() { return wrap(api.siblingOf(this._id, -1)); }
     replaceChild(fresh, stale) {
       // Core DOM, and its absence is not a small gap: a hydrator that cannot
       // replace a node creates a new one beside it, which is how a page ends up
@@ -1632,6 +1660,73 @@
     set textContent(v) { this.value = v; }
   }
 
+  /// A **live** `NamedNodeMap`, which is what the DOM says `attributes` is.
+  ///
+  /// Liveness is not a nicety here. React clears an element it is re-hydrating
+  /// with `for (const map = el.attributes; map.length; )
+  /// el.removeAttributeNode(map[0])`, and over the snapshot array this used to
+  /// return, `map.length` never falls and the loop never ends.
+  class NamedNodeMap {
+    constructor(owner) { this._owner = owner; }
+    get length() { return api.attrNames(this._owner._id).length; }
+    item(index) {
+      const name = api.attrNames(this._owner._id)[Number(index)];
+      return name === undefined ? null : this._owner.getAttributeNode(name);
+    }
+    getNamedItem(name) { return this._owner.getAttributeNode(name); }
+    setNamedItem(attr) { return this._owner.setAttributeNode(attr); }
+    removeNamedItem(name) {
+      const attr = this._owner.getAttributeNode(name);
+      if (!attr) {
+        throw new DOMException(`there is no attribute named \`${name}\``, "NotFoundError");
+      }
+      return this._owner.removeAttributeNode(attr);
+    }
+    // Namespaces are not modelled in this tree, so the local name is the whole
+    // name and the NS forms are the plain ones.
+    getNamedItemNS(namespace, localName) { return this.getNamedItem(localName); }
+    setNamedItemNS(attr) { return this.setNamedItem(attr); }
+    removeNamedItemNS(namespace, localName) { return this.removeNamedItem(localName); }
+    [Symbol.iterator]() {
+      const map = this;
+      let at = 0;
+      return {
+        next: () => (at < map.length
+          ? { value: map.item(at++), done: false }
+          : { value: undefined, done: true }),
+      };
+    }
+  }
+
+  const ARRAY_INDEX = /^(0|[1-9][0-9]*)$/;
+
+  /// The index and named access WebIDL gives the map, over that live backing.
+  const namedNodeMapHandler = {
+    get(target, key) {
+      if (typeof key !== "string" || key in target) return Reflect.get(target, key);
+      if (ARRAY_INDEX.test(key)) return target.item(Number(key));
+      return target.getNamedItem(key);
+    },
+    has(target, key) {
+      if (typeof key !== "string" || key in target) return Reflect.has(target, key);
+      if (ARRAY_INDEX.test(key)) return target.item(Number(key)) !== null;
+      return target.getNamedItem(key) !== null;
+    },
+    ownKeys(target) {
+      const names = api.attrNames(target._owner._id);
+      return names.map((_, index) => String(index)).concat(names);
+    },
+    getOwnPropertyDescriptor(target, key) {
+      if (typeof key === "string" && !(key in target)) {
+        const value = ARRAY_INDEX.test(key)
+          ? target.item(Number(key))
+          : target.getNamedItem(key);
+        if (value) return { configurable: true, enumerable: true, writable: false, value };
+      }
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  };
+
   /// A processing instruction, which this engine's parser never produces —
   /// blitz reads `<?pi?>` as a comment — but pages construct to inspect, and
   /// the demand list counted 195 asks for exactly that.
@@ -1776,6 +1871,45 @@
       }
     }
     hasAttribute(name) { return api.getAttr(this._id, String(name)) !== null; }
+    /// The attribute-node family. The `Attr` handed back is a *view* of the
+    /// element's attribute rather than a copy — its `value` reads through — so
+    /// a node taken from the live map above cannot disagree with the element.
+    ///
+    /// The name is tried as written before it is lowered, because this tree
+    /// holds `viewBox` on an `<svg>` exactly as the parser read it.
+    getAttributeNode(name) {
+      const node = this;
+      const exact = String(name);
+      const make = (as) => internal(() => new Attr(as, api.getAttr(node._id, as), node));
+      if (api.getAttr(node._id, exact) !== null) return make(exact);
+      const lowered = exact.toLowerCase();
+      if (lowered !== exact && api.getAttr(node._id, lowered) !== null) return make(lowered);
+      return null;
+    }
+    getAttributeNodeNS(namespace, localName) { return this.getAttributeNode(localName); }
+    setAttributeNode(attr) {
+      if (!attr || attr.nodeType !== 2) throw new TypeError("setAttributeNode takes an Attr");
+      const previous = this.getAttributeNode(attr.name);
+      this.setAttribute(attr.name, attr.value);
+      attr._owner = this;
+      return previous;
+    }
+    setAttributeNodeNS(attr) { return this.setAttributeNode(attr); }
+    /// Remove the attribute this node stands for and hand the node back
+    /// detached, still holding the value it had: its owner is gone, so it has
+    /// nothing left to read through to.
+    removeAttributeNode(attr) {
+      if (!attr || attr.nodeType !== 2) throw new TypeError("removeAttributeNode takes an Attr");
+      const name = attr.name;
+      if (api.getAttr(this._id, name) === null) {
+        throw new DOMException(`there is no attribute named \`${name}\``, "NotFoundError");
+      }
+      const held = attr.value;
+      this.removeAttribute(name);
+      attr._owner = null;
+      attr._value = held;
+      return attr;
+    }
     toggleAttribute(name, force) {
       const has = this.hasAttribute(name);
       const want = force === undefined ? !has : !!force;
@@ -1915,20 +2049,21 @@
     // name. The last is not a nicety: jQuery 1.x reads
     // `div.attributes["onsubmit"].expando` and threw on the undefined, before
     // it had finished defining `$`.
+    // One map per element, as a browser hands back: the liveness is in the
+    // reads, so there is nothing to rebuild and nothing that goes stale.
     get attributes() {
-      const node = this;
-      const list = api.attrNames(this._id).map((name) => internal(
-        () => new Attr(name, api.getAttr(node._id, name), node),
-      ));
-      list.getNamedItem = (name) =>
-        list.find((a) => a.name === String(name).toLowerCase()) || null;
-      for (const attr of list) {
-        // A named property never shadows something the list already answers
-        // to: `length` is the count, not the attribute of that name.
-        if (attr.name in list) continue;
-        Object.defineProperty(list, attr.name, { configurable: true, value: attr });
+      if (!this.__h5iAttrMap) {
+        this.__h5iAttrMap = new Proxy(new NamedNodeMap(this), namedNodeMapHandler);
       }
-      return list;
+      return this.__h5iAttrMap;
+    }
+    /// The slot this node was distributed into, or null.
+    ///
+    /// Distribution here is a move rather than a virtual assignment — see the
+    /// shadow-root attach above — so an assigned node's parent *is* its slot.
+    get assignedSlot() {
+      const parent = this.parentNode;
+      return parent && parent.nodeType === 1 && parent.tagName === "SLOT" ? parent : null;
     }
     hasAttributes() { return api.attrNames(this._id).length > 0; }
     getAttributeNames() { return api.attrNames(this._id); }
@@ -5782,6 +5917,10 @@
   // a parallel object, so what script sets is what the cascade sees and what a
   // later `getAttribute("style")` returns. One source of truth, same rule the
   // DOM follows.
+  /// The priority suffix, recognised in one place so the reader and the writer
+  /// cannot disagree about what it looks like.
+  const IMPORTANT = /!\s*important\s*$/i;
+
   class StyleDeclaration {
     /// `source` is a get/set pair for the declaration *text*.
     ///
@@ -5818,16 +5957,35 @@
 
     getPropertyValue(name) {
       const property = String(name).toLowerCase();
-      return serializedValue(property, this._read().get(property));
+      const raw = this._read().get(property);
+      // Without its priority: `!important` belongs to the declaration, and a
+      // page comparing this against a plain value must not see it here.
+      return serializedValue(
+        property,
+        raw === undefined ? raw : raw.replace(IMPORTANT, "").trim()
+      );
     }
-    setProperty(name, value) {
+    /// `"important"` or `""`, which is the whole of this method.
+    ///
+    /// It was missing, so `el.style.getPropertyPriority(...)` was a call on
+    /// nothing. Anything walking a declaration calls it — that is how a style
+    /// is copied without losing its priorities.
+    getPropertyPriority(name) {
+      const raw = this._read().get(String(name).toLowerCase());
+      return raw !== undefined && IMPORTANT.test(raw) ? "important" : "";
+    }
+    setProperty(name, value, priority) {
       // A **copy**: `_read()` hands back the shared memo, and mutating it would
       // corrupt the entry every other element with the same `style` text reads.
       const map = new Map(this._read());
       if (value === "" || value === null || value === undefined) {
         map.delete(String(name).toLowerCase());
       } else {
-        map.set(String(name).toLowerCase(), String(value));
+        const important = String(priority ?? "").toLowerCase() === "important";
+        map.set(
+          String(name).toLowerCase(),
+          important ? `${String(value)} !important` : String(value)
+        );
       }
       this._write(map);
     }
@@ -5862,9 +6020,24 @@
   // `el.style.backgroundColor = 'red'` has to reach `background-color`, so the
   // camelCase surface is a proxy over the dashed one rather than a second list
   // that could disagree with it.
+  /// Whether a name on a style declaration is a CSS property at all.
+  ///
+  /// Asked of Stylo with `inherit`, which is valid for every real property.
+  /// The vendor dance maps `WebkitFoo` back to `-webkit-foo`, which
+  /// camel-to-dash alone cannot know.
+  function isStyleName(key) {
+    const dash = camelToDash(key);
+    if (api.supportsCss(dash, "inherit")) return true;
+    return /^(webkit|moz|ms|o)-/.test(dash) && api.supportsCss(`-${dash}`, "inherit");
+  }
+
   const styleHandler = {
     get(target, key) {
       if (typeof key !== "string" || key in target) return Reflect.get(target, key);
+      // A name that is not a property is *absent*, not empty. Answering `""`
+      // for everything made `style.anything()` a call on a string, and the
+      // `has` trap below already disagreed with it.
+      if (!isStyleName(key)) return undefined;
       return target.getPropertyValue(camelToDash(key));
     },
     // `"color" in el.style` is how pages feature-detect a CSS property, and
@@ -5874,9 +6047,7 @@
     // back to `-webkit-foo`, which camel-to-dash alone cannot know.
     has(target, key) {
       if (typeof key !== "string" || key in target) return Reflect.has(target, key);
-      const dash = camelToDash(key);
-      if (api.supportsCss(dash, "inherit")) return true;
-      return /^(webkit|moz|ms|o)-/.test(dash) && api.supportsCss(`-${dash}`, "inherit");
+      return isStyleName(key);
     },
     set(target, key, value) {
       if (typeof key === "string" && !(key in target)) {
@@ -5890,6 +6061,11 @@
   StyleDeclaration = function (source) {
     return new Proxy(new RawStyleDeclaration(source), styleHandler);
   };
+  // This wrapper is what pages see as `CSSStyleDeclaration`, so it has to carry
+  // the real prototype: a plain function's own is a fresh empty object, which
+  // left `CSSStyleDeclaration.prototype.setProperty` undefined and every
+  // `style instanceof CSSStyleDeclaration` false.
+  StyleDeclaration.prototype = RawStyleDeclaration.prototype;
 
   // ── events ───────────────────────────────────────────────────────────────
 
@@ -6231,10 +6407,23 @@
   // Capture down, then bubble up: the order a page's handlers were written
   // against. A listener that throws does not stop the others, because one bad
   // handler taking the page down is worse than one handler not running.
+  /// The node the window's listeners sit on, looked up once.
+  let windowNode = null;
+
   function dispatch(target, event) {
     event.target = target;
     const chain = path(target);
 
+    // A `load` at an element reaches the document and stops: a Document's parent
+    // is null for this one type (DOM 2.9). Window and document are the same node
+    // here, so sparing the top of the chain is what implements it. Without it a
+    // capturing window listener runs once per subresource, and a library that
+    // installs a fresh one each time grows them quadratically.
+    if (event.type === "load" && chain.length > 1) {
+      if (windowNode === null) windowNode = api.root();
+      const at = chain.findIndex((n) => n._id === windowNode);
+      if (at > 0) chain.length = at;
+    }
     const fire = (node, capture) => {
       if (event._stopped) return;
       event.currentTarget = node;
@@ -6556,6 +6745,7 @@
     constructor(body, init) {
       const i = init || {};
       this._body = body == null ? "" : String(body);
+      this._bytes = i.bytes;
       this.status = i.status === undefined ? 200 : Number(i.status);
       this.statusText = i.statusText === undefined ? "" : String(i.statusText);
       this.ok = this.status >= 200 && this.status < 300;
@@ -6577,19 +6767,20 @@
     }
     arrayBuffer() {
       this.bodyUsed = true;
-      const text = this._body;
-      const bytes = new TextEncoder().encode(text);
-      return Promise.resolve(bytes.buffer);
+      if (this._bytes) return Promise.resolve(this._bytes.slice().buffer);
+      return Promise.resolve(new TextEncoder().encode(this._body).buffer);
     }
     blob() {
       this.bodyUsed = true;
       const type = this.headers.get("content-type") || "";
-      return Promise.resolve(new Blob([this._body], { type }));
+      const from = this._bytes ? this._bytes.slice() : this._body;
+      return Promise.resolve(new Blob([from], { type }));
     }
     clone() {
       return new Response(this._body, {
         status: this.status, statusText: this.statusText, headers: this.headers,
         type: this.type, url: this.url, redirected: this.redirected,
+        bytes: this._bytes,
       });
     }
     static json(data, init) {
@@ -6620,6 +6811,21 @@
       if (type !== "abort") return;
       const at = this._listeners.indexOf(handler);
       if (at >= 0) this._listeners.splice(at, 1);
+    }
+    /// Through the same list `addEventListener` writes to, so a dispatched
+    /// abort and a real one reach exactly the same handlers.
+    dispatchEvent(event) {
+      if (!event || event.type !== "abort") return true;
+      if (event.target === null || event.target === undefined) event.target = this;
+      for (const handler of this._listeners.slice()) {
+        try {
+          handler.call(this, event);
+        } catch (error) {
+          console.error(`abort listener threw: ${withStack(error)}`);
+        }
+      }
+      if (typeof this.onabort === "function") this.onabort(event);
+      return !event.defaultPrevented;
     }
     throwIfAborted() { if (this.aborted) throw this.reason; }
     /// Deliver the abort: flip the state, then tell every listener.
@@ -6770,10 +6976,23 @@
     forEach(fn, thisArg) {
       for (const [k, v] of this._entries.slice()) fn.call(thisArg, v, k, this);
     }
-    append(k, v) { this._entries.push([String(k), String(v)]); }
-    set(k, v) {
+    // A `Blob` stays a `Blob`: only a non-Blob value is converted to a string.
+    // `String(v)` on every value turned React's server-action payload into the
+    // eight characters `[object Object]`, and the reply it pointed at was the
+    // request grok.com's server answered with a 500.
+    append(k, v, filename) {
+      if (v instanceof Blob) {
+        const part = filename === undefined ? v : v.slice(0, v.size, v.type);
+        if (filename !== undefined) part.name = String(filename);
+        else if (part.name === undefined && v instanceof File) part.name = v.name;
+        this._entries.push([String(k), part]);
+        return;
+      }
+      this._entries.push([String(k), String(v)]);
+    }
+    set(k, v, filename) {
       this.delete(k);
-      this.append(k, v);
+      this.append(k, v, filename);
     }
     get(k) { const hit = this._entries.find(([n]) => n === String(k)); return hit ? hit[1] : null; }
     getAll(k) { return this._entries.filter(([n]) => n === String(k)).map(([, v]) => v); }
@@ -6860,6 +7079,9 @@
       case "any-hover": return value === "none";
       case "pointer": return value === "none";
       case "any-pointer": return value === "none";
+      // Not installed and not full screen: a page asking whether it is running
+      // as an app is told no, which is the truth rather than a gap.
+      case "display-mode": return value === "browser";
       default:
         api.unsupported(`matchMedia(${name})`);
         return false;
@@ -7502,6 +7724,8 @@
     "_tag",
     // The token list a `classList` read memoises on its element.
     "__h5iClassList",
+    // The live attribute map an `attributes` read memoises beside it.
+    "__h5iAttrMap",
     // A form control's dirty overlay: present only once something set it.
     "_checked", "_value", "_selected",
     // The shadow root an element may have been given, and usually was not.
@@ -7867,9 +8091,7 @@
       return collection(out);
     },
     createTextNode(text) { return wrap(api.createText(String(text))); },
-    /// A detached attribute node. **`setAttributeNode` does not exist here**,
-    /// so what comes back is inspectable and not yet installable; saying so is
-    /// better than a comment promising a method the prelude has never had.
+    /// A detached attribute node, which `setAttributeNode` then installs.
     createAttribute(name) {
       const lowered = String(name).toLowerCase();
       validateQualifiedName(lowered);
@@ -7935,6 +8157,15 @@
     removeEventListener(type, handler) {
       const root = wrap(api.root());
       if (root) root.removeEventListener(type, handler);
+    },
+    /// The third of the three. Listeners already delegated to the root and
+    /// dispatch did not exist at all, so `document.dispatchEvent(...)` — which
+    /// is how a page sends itself a custom event — was a call on nothing.
+    dispatchEvent(event) {
+      const root = wrap(api.root());
+      if (!root) return true;
+      if (event && event.target === null) event.target = document;
+      return root.dispatchEvent(event);
     },
     // Non-HttpOnly cookies only, exactly as a browser exposes them. The
     // withholding is the point: a session credential is almost always HttpOnly,
@@ -8022,6 +8253,37 @@
     // something this engine is missing.
     namespaceURI: undefined,
     ownerDocument: null,
+    // Never prerendered here, but the answer is a boolean either way: read as a
+    // gap, a page waits on a `prerenderingchange` that is not coming.
+    prerendering: false,
+    // IE's, and absent in every browser a page would meet today. Defined so
+    // the feature test that reads it is answered rather than counted a gap.
+    documentMode: undefined,
+    /// The loaded font set, which is what a page waits on before it measures
+    /// text. Already settled: this engine has the fonts it has by the time
+    /// script runs, so `ready` is resolved and `status` promises nothing more.
+    get fonts() {
+      if (!this.__h5iFonts) {
+        const faces = new Set();
+        const set = {
+          status: "loaded",
+          get size() { return faces.size; },
+          add(face) { faces.add(face); return this; },
+          has(face) { return faces.has(face); },
+          delete(face) { return faces.delete(face); },
+          clear() { faces.clear(); },
+          forEach(fn, thisArg) { for (const f of faces) fn.call(thisArg, f, f, set); },
+          check() { return true; },
+          load() { return Promise.resolve([]); },
+          addEventListener() {},
+          removeEventListener() {},
+          [Symbol.iterator]() { return faces[Symbol.iterator](); },
+        };
+        set.ready = Promise.resolve(set);
+        this.__h5iFonts = set;
+      }
+      return this.__h5iFonts;
+    },
     get implementation() { return domImplementation(null); },
 
     /// **"CSS1Compat", and that is a fact about this engine rather than a
@@ -8260,6 +8522,18 @@
 
   // Only *converging* timers count as work outstanding.
   lazyGlobals("sockets", ["WebSocket", "EventSource"]);
+  lazyGlobals("indexeddb", [
+    "indexedDB", "IDBFactory", "IDBDatabase", "IDBObjectStore", "IDBIndex",
+    "IDBTransaction", "IDBRequest", "IDBOpenDBRequest", "IDBCursor",
+    "IDBCursorWithValue", "IDBKeyRange", "IDBVersionChangeEvent",
+  ]);
+  lazyGlobals("perfobserver", ["PerformanceObserver", "PerformanceObserverEntryList"]);
+  lazyGlobals("streams", [
+    "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController",
+    "WritableStream", "WritableStreamDefaultWriter", "WritableStreamDefaultController",
+    "TransformStream", "TransformStreamDefaultController",
+    "CountQueuingStrategy", "ByteLengthQueuingStrategy",
+  ]);
 
   /// What the settle loop asks every round. A page that never opened a socket
   /// has no sockets to drain, and answering that without loading the tier is
@@ -8395,6 +8669,14 @@
   }
   const location = {
     get href() { return currentAddress; },
+    /// Assigning navigates in a browser, and this engine does not let a page
+    /// navigate itself. Recorded rather than *refused*: a getter with no setter
+    /// throws, and the throw took down whatever was running — a React timer
+    /// callback died mid-render over a redirect the page only attempted.
+    set href(value) {
+      api.unsupported("location.href");
+      void value;
+    },
     get protocol() { return locationParts().protocol ?? ""; },
     get host() { return locationParts().host ?? ""; },
     get hostname() { return locationParts().hostname ?? ""; },
@@ -8493,6 +8775,14 @@
   // this machine was.
   const performanceEntries = [];
   const performanceMarks = new Map();
+  // Set by `prelude/perfobserver.js`, and empty until a page asks for the
+  // interface, so a page that never observes pays nothing for the hook.
+  const performanceObservers = new Set();
+  globalThis.__h5iAddPerfObserver = (o) => performanceObservers.add(o);
+  globalThis.__h5iRemovePerfObserver = (o) => performanceObservers.delete(o);
+  function offerEntry(entry) {
+    for (const observer of performanceObservers) observer.__offer(entry);
+  }
   const performance = {
     now: () => clock,
     timeOrigin: 0,
@@ -8501,6 +8791,7 @@
       performanceMarks.set(String(name), at);
       const entry = { name: String(name), entryType: "mark", startTime: at, duration: 0 };
       performanceEntries.push(entry);
+      offerEntry(entry);
       return entry;
     },
     measure(name, startOrOptions, endMark) {
@@ -8516,6 +8807,7 @@
         duration: Math.max(0, end - start),
       };
       performanceEntries.push(entry);
+      offerEntry(entry);
       return entry;
     },
     getEntries() { return performanceEntries.slice(); },
@@ -8543,9 +8835,12 @@
     const root = wrap(api.root());
     if (root) root.addEventListener(type, handler, options);
   }
-  function removeEventListener(type, handler) {
+  // `options` too: capture is part of what identifies a listener, so dropping
+  // it here removed a bubbling listener that was never registered and left the
+  // capturing one the caller meant in place for ever.
+  function removeEventListener(type, handler, options) {
     const root = wrap(api.root());
-    if (root) root.removeEventListener(type, handler);
+    if (root) root.removeEventListener(type, handler, options);
   }
   function dispatchEvent(event) {
     const root = wrap(api.root());
@@ -9736,6 +10031,23 @@
       appVersion: api.userAgent().replace(/^Mozilla\//, ""),
       appCodeName: "Mozilla",
       product: "Gecko",
+      // Unset. This engine sends no `DNT`, and null is how a browser says so.
+      doNotTrack: null,
+      /// A fire-and-forget POST, sent rather than stubbed: the allowlist still
+      /// decides whether it leaves, and a page told "not queued" falls back to
+      /// a synchronous request that costs it more than the beacon would.
+      sendBeacon(url, data) {
+        try {
+          fetch(String(url), {
+            method: "POST",
+            body: data === undefined ? null : data,
+            keepalive: true,
+          }).catch(() => {});
+          return true;
+        } catch (error) {
+          return false;
+        }
+      },
       // ── The session's identity, from the host ────────────────────────────
       //
       // Literals here were the bug, not the style: the broker wrote the same
@@ -9885,12 +10197,50 @@
       // would, and it would never find out.
       if (!element || element._id === undefined) return { getPropertyValue: () => "" };
       const read = (name) => api.computedStyle(element._id, String(name)) || "";
+      /// The whole interface, not one method of it.
+      ///
+      /// The proxy below answers any name it does not recognise with a
+      /// property *value*, so a backing object carrying only
+      /// `getPropertyValue` turned every other member into `""` — and calling
+      /// one threw "not a callable function" on an empty string. A resolved
+      /// style is read-only, which is what the two mutators say.
+      const refuse = () => {
+        throw new DOMException(
+          "a computed style is read-only",
+          "NoModificationAllowedError"
+        );
+      };
+      const backing = {
+        getPropertyValue: read,
+        // A resolved value never carries `!important`: the cascade is already
+        // over by the time it is read.
+        getPropertyPriority: () => "",
+        setProperty: refuse,
+        removeProperty: refuse,
+        // Enumerating the resolved longhands needs a list this engine does not
+        // keep, so it says so rather than answering an empty style.
+        get length() {
+          api.unsupported("getComputedStyle().length");
+          return 0;
+        },
+        item: () => {
+          api.unsupported("getComputedStyle().item");
+          return "";
+        },
+        // Both are what a browser reports for a *computed* declaration.
+        get cssText() { return ""; },
+        set cssText(value) { void value; refuse(); },
+        parentRule: null,
+      };
+      Object.setPrototypeOf(backing, StyleDeclaration.prototype);
       return new Proxy(
-        { getPropertyValue: read },
+        backing,
         {
           get(target, key) {
             if (typeof key !== "string" || key in target) return Reflect.get(target, key);
-            return read(camelToDash(key));
+            // Absent, not empty — the same rule the `has` trap below applies.
+            const dash = camelToDash(key);
+            return api.isCssProperty(dash) ? read(dash) : undefined;
           },
           // `"color" in getComputedStyle(el)` asks `has`, not `get`, and without this trap it
           // fell through to the bare backing object and answered **false for every property**.
@@ -9910,11 +10260,10 @@
     IntersectionObserver, ResizeObserver,
   });
 
-  // The display, when the identity declares one: its own tier, loaded here
-  // rather than on a property read. `screen` behind an accessor would be the
-  // tell this feature exists to avoid — a page reads descriptors first. See
-  // `prelude/screen.js`.
-  if (identity.screen) __h5iTier("screen");
+  // The display: its own tier, loaded here rather than on a property read.
+  // `screen` behind an accessor would be the tell this feature exists to avoid
+  // — a page reads descriptors first. See `prelude/screen.js`.
+  __h5iTier("screen");
 
   // Interface objects are **not enumerable** on the global, and every one of ours was.
   for (const name of Object.getOwnPropertyNames(globalThis)) {
@@ -9951,8 +10300,32 @@
     }
 
     let body = request.body ?? "";
-    if (body instanceof FormData) body = body.toString();
-    else if (body && typeof body !== "string") {
+    // What `fetch` sets when the page did not: the body's own type decides it,
+    // and only this side knows what the body was before it became bytes.
+    let bodyType = null;
+    if (body instanceof FormData) {
+      // Its own tier: only a page that posts a form pays to parse it.
+      __h5iTier("multipart");
+      const wire = globalThis.__h5iMultipartBody(body);
+      body = wire.bytes;
+      bodyType = wire.type;
+    } else if (body instanceof Blob) {
+      bodyType = body.type || null;
+      body = new Uint8Array(body._bytes);
+    } else if (body instanceof URLSearchParams) {
+      body = body.toString();
+      bodyType = "application/x-www-form-urlencoded;charset=UTF-8";
+    }
+    // Bytes reach the host as bytes, and so fall through untouched. A typed
+    // array stringified here became `{"0":0,"1":0,...}`, which is what a
+    // gRPC-web server was reading when it called our frame's compression flag
+    // invalid — it was quoting the `{`.
+    else if (
+      body
+      && typeof body !== "string"
+      && !(body instanceof ArrayBuffer)
+      && !ArrayBuffer.isView(body)
+    ) {
       try { body = JSON.stringify(body); } catch (_) { body = String(body); }
     }
 
@@ -9966,6 +10339,11 @@
     // questions would not be subject to a policy at all.
     const headerPairs = [];
     for (const [name, value] of request.headers) headerPairs.push([name, value]);
+    // The page's own header wins: setting one is how a page overrides what the
+    // body would imply, and a boundary the page chose is one its server expects.
+    if (bodyType !== null && !request.headers.has("content-type")) {
+      headerPairs.push(["content-type", bodyType]);
+    }
     const id = api.fetchStart(
       request.url, request.method, body,
       request.mode, request.credentials, headerPairs,
@@ -10001,6 +10379,10 @@
     // expects. It used to be an object literal with the same fields, which
     // reads identically until something asks what it is.
     return new Response(res.text, {
+      // The bytes as they arrived, when the UTF-8 decode above lost something.
+      // `arrayBuffer()` and `blob()` owe the page these rather than a re-encode
+      // of the replacement characters.
+      bytes: res.bytes,
       status: res.status,
       statusText: res.status === 200 ? "OK" : "",
       headers,

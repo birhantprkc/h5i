@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use std::time::Duration;
 
-use boa_engine::{js_string, Context, Module, Source};
+use boa_engine::{js_string, Context, JsString, JsValue, Module, Source};
 
 use crate::engine::Dom;
 use host::{ConsoleLine, Host, HostHandle};
@@ -21,8 +21,14 @@ const PRELUDE: &str = include_str!("prelude.js");
 const TIERS: &[(&str, &str)] = &[
     ("conformance", include_str!("prelude/conformance.js")),
     ("sockets", include_str!("prelude/sockets.js")),
+    ("streams", include_str!("prelude/streams.js")),
+    ("perfobserver", include_str!("prelude/perfobserver.js")),
+    ("multipart", include_str!("prelude/multipart.js")),
+    ("indexeddb", include_str!("prelude/indexeddb.js")),
     ("has", include_str!("prelude/has.js")),
-    #[cfg(feature = "identity")]
+    // Not behind `identity` any more: the display answers from the viewport when
+    // nothing is declared, so every build has one. Gated, a build without the
+    // feature had no tier to load and the prelude refused to start at all.
     ("screen", include_str!("prelude/screen.js")),
 ];
 
@@ -421,9 +427,45 @@ pub struct Script {
     /// How long the job queue may run. Overridable so a test can prove the
     /// deadline fires without waiting the real budget out.
     job_budget: Duration,
+    /// What settling has already used of [`Self::job_budget`].
+    ///
+    /// The budget is for the whole load, not for each call. A page's load fires
+    /// its subresource events in bounded passes and settles after every one, so
+    /// a per-call budget multiplied by the number of passes: a page against a
+    /// 45-second intent reached the engine's 105-second watchdog that way.
+    job_spent: Duration,
 
     /// What building this realm cost, by phase. See [`RealmCost`].
     cost: RealmCost,
+}
+
+
+thread_local! {
+    /// Diagnostic accumulators for one settle, in the order the loop runs them.
+    static SETTLE_COST: std::cell::RefCell<[Duration; 5]> =
+        const { std::cell::RefCell::new([Duration::ZERO; 5]) };
+}
+
+/// Whether to report what a page load spent its time on.
+///
+/// Read once: the check is on the per-script and per-settle-round paths. The
+/// report goes to stderr, which the sandbox does not carry out, so profile with
+/// `--no-sandbox`.
+pub(crate) fn timing_page() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("H5I_TIME_PAGE").is_some())
+}
+
+/// Run `body`, adding what it cost to slot `slot`.
+fn charged<T>(slot: usize, body: impl FnOnce() -> T) -> T {
+    if !timing_page() {
+        return body();
+    }
+    let at = std::time::Instant::now();
+    let out = body();
+    let spent = at.elapsed();
+    SETTLE_COST.with(|c| c.borrow_mut()[slot] += spent);
+    out
 }
 
 impl Script {
@@ -548,6 +590,7 @@ impl Script {
             context,
             cancel,
             job_budget: JOB_QUEUE_BUDGET,
+            job_spent: Duration::ZERO,
             cost,
             host,
             pending_modules: Vec::new(),
@@ -648,6 +691,14 @@ impl Script {
 
     /// Evaluate and return the completion value, for tests and for a future
     /// `session eval`.
+    /// Tell the realm what the parsed comment nodes said.
+    ///
+    /// `api.getText` answers a comment out of this map, because the tree does
+    /// not keep the text: see [`crate::engine::Page::parsed_comments`].
+    pub fn seed_comments(&self, texts: std::collections::HashMap<usize, String>) {
+        self.host.comments.borrow_mut().extend(texts);
+    }
+
     pub fn eval_value(&mut self, source: &str) -> Result<String, String> {
         match self.context.eval(Source::from_bytes(source)) {
             Ok(value) => Ok(value
@@ -666,9 +717,24 @@ impl Script {
     /// and a promise can set a timer. It stops when a round does nothing, or when
     /// the budget is spent, and the difference is reported rather than hidden.
     pub fn settle(&mut self) -> Settled {
-        let budget = self.job_budget;
+        if timing_page() {
+            SETTLE_COST.with(|c| *c.borrow_mut() = [Duration::ZERO; 5]);
+        }
+        let budget = self.job_allowance();
+        let at = std::time::Instant::now();
         let (mut settled, cut_short) =
             self.with_job_deadline(budget, |script| script.settle_inner(None).0);
+        self.job_spent += at.elapsed();
+        if timing_page() {
+            let spent = SETTLE_COST.with(|c| *c.borrow());
+            let name = ["jobs", "layout-observers", "fetches", "timers", "sockets"];
+            let line: Vec<String> = name
+                .iter()
+                .zip(spent.iter())
+                .map(|(n, d)| format!("{n}={:.0}ms", d.as_secs_f64() * 1000.0))
+                .collect();
+            eprintln!("PAGE_TIME settle {}", line.join(" "));
+        }
         if cut_short {
             settled.cut_off = true;
             self.note_error(&format!(
@@ -698,7 +764,8 @@ impl Script {
     }
 
     fn settle_with(&mut self, ready: &mut Ready<'_>) -> Waited {
-        let budget = self.job_budget;
+        let budget = self.job_allowance();
+        let at = std::time::Instant::now();
         // `with_job_deadline` returns (closure result, deadline fired), and the
         // closure itself returns (settled, met). Destructured in one pattern so
         // the two bools cannot be read in the wrong order, which is exactly
@@ -706,6 +773,7 @@ impl Script {
         // met condition as a blown budget.
         let ((settled, met), cut_short) =
             self.with_job_deadline(budget, |script| script.settle_inner(Some(ready)));
+        self.job_spent += at.elapsed();
         let end = if met {
             WaitEnd::Met
         } else if cut_short || settled.cut_off {
@@ -775,19 +843,19 @@ impl Script {
         }
 
         loop {
-            self.run_queued_jobs();
+            charged(0, || self.run_queued_jobs());
 
             // Layout observers are driven from here rather than from a frame
             // clock, because this engine has no frames at rest: an observer
             // that waited for a repaint would never fire at all.
-            self.run_layout_observers();
+            charged(1, || self.run_layout_observers());
 
             // Requests that have come back resolve their promises here, which
             // is what lets `fetch` be concurrent: the host starts up to six at
             // once and this is where the page learns any of them finished.
-            let outstanding = self.drain_fetches();
+            let outstanding = charged(2, || self.drain_fetches());
 
-            let ran = self.run_due_timers(clock);
+            let ran = charged(3, || self.run_due_timers(clock));
             timers_run += ran;
 
             // Frames that arrived since the last round become events here.
@@ -798,7 +866,7 @@ impl Script {
             // as permanently busy. The interval precedent applies: a perpetual
             // thing that counts as pending makes every page that has one look
             // like it never finished.
-            let delivered = self.drain_sockets();
+            let delivered = charged(4, || self.drain_sockets());
 
             // After the round's work, before deciding whether to wait longer.
             if ready_now!() {
@@ -948,6 +1016,19 @@ impl Script {
     /// it cannot wait the default out.
     pub fn set_job_budget(&mut self, budget: Duration) {
         self.job_budget = budget;
+        self.job_spent = Duration::ZERO;
+    }
+
+    /// What is left of the whole load's allowance.
+    ///
+    /// Never zero: a later pass exists to deliver events the page is owed, and
+    /// one given no time at all would report the page as unfinished without
+    /// having tried. The floor is small enough that the passes cannot add up to
+    /// anything like the old per-call budget.
+    fn job_allowance(&self) -> Duration {
+        self.job_budget
+            .saturating_sub(self.job_spent)
+            .max(Duration::from_millis(100))
     }
 
     /// Run `body` with a wall-clock deadline on the job queue.
@@ -1023,14 +1104,23 @@ impl Script {
         }
     }
 
+    /// Call one of the prelude's settle drivers by name.
+    ///
+    /// The loop asks four of these a round and a page can take hundreds, so
+    /// evaluating them as source recompiled the same call expressions thousands
+    /// of times: most of what the engine spent in its parser.
+    fn call_driver(&mut self, name: &str, args: &[JsValue]) -> Option<JsValue> {
+        let global = self.context.global_object();
+        let f = global.get(JsString::from(name), &mut self.context).ok()?;
+        let f = f.as_callable()?.clone();
+        f.call(&JsValue::undefined(), args, &mut self.context).ok()
+    }
+
     /// Resolve whatever has come back, and report how much is still owed.
     fn drain_fetches(&mut self) -> usize {
-        match self
-            .context
-            .eval(Source::from_bytes("__h5iDrainFetches()"))
-        {
-            Ok(value) => value.as_number().unwrap_or(0.0).max(0.0) as usize,
-            Err(_) => 0,
+        match self.call_driver("__h5iDrainFetches", &[]) {
+            Some(value) => value.as_number().unwrap_or(0.0).max(0.0) as usize,
+            None => 0,
         }
     }
 
@@ -1047,30 +1137,21 @@ impl Script {
     }
 
     fn run_layout_observers(&mut self) {
-        let _ = self
-            .context
-            .eval(Source::from_bytes("__h5iRunLayoutObservers()"));
+        let _ = self.call_driver("__h5iRunLayoutObservers", &[]);
     }
 
     fn run_due_timers(&mut self, clock: u64) -> usize {
-        let source = format!("__h5iRunTimers({clock})");
-        match self.context.eval(Source::from_bytes(&source)) {
-            Ok(value) => value.as_number().unwrap_or(0.0).max(0.0) as usize,
-            Err(_) => 0,
+        match self.call_driver("__h5iRunTimers", &[JsValue::from(clock as f64)]) {
+            Some(value) => value.as_number().unwrap_or(0.0).max(0.0) as usize,
+            None => 0,
         }
     }
 
     /// When the earliest waiting timer is due, in virtual milliseconds.
     fn next_timer_due(&mut self) -> Option<u64> {
-        match self
-            .context
-            .eval(Source::from_bytes("__h5iNextTimerDue()"))
-        {
-            Ok(value) => match value.as_number() {
-                Some(due) if due >= 0.0 => Some(due as u64),
-                _ => None,
-            },
-            Err(_) => None,
+        match self.call_driver("__h5iNextTimerDue", &[])?.as_number() {
+            Some(due) if due >= 0.0 => Some(due as u64),
+            _ => None,
         }
     }
 
@@ -1085,9 +1166,9 @@ impl Script {
         if self.host.sockets.borrow().is_empty() && self.host.streams.borrow().is_empty() {
             return 0;
         }
-        match self.context.eval(Source::from_bytes("__h5iDrainSockets()")) {
-            Ok(value) => value.as_number().unwrap_or(0.0).max(0.0) as usize,
-            Err(_) => 0,
+        match self.call_driver("__h5iDrainSockets", &[]) {
+            Some(value) => value.as_number().unwrap_or(0.0).max(0.0) as usize,
+            None => 0,
         }
     }
 
@@ -1356,6 +1437,16 @@ impl Script {
             None => "globalThis.__h5iCurrentScript = null;".to_string(),
         };
         let _ = self.context.eval(Source::from_bytes(&code));
+    }
+
+    /// The microtask checkpoint a browser performs when a script finishes.
+    ///
+    /// Boa's queue was otherwise drained at the settle, so every script's
+    /// continuations ran after the *last* script rather than between them, with
+    /// no script on the stack and `document.currentScript` null. Bounded by the
+    /// phase the caller already checks rather than a deadline of its own.
+    pub fn microtask_checkpoint(&mut self) {
+        self.run_queued_jobs();
     }
 
     pub fn console(&self) -> Vec<ConsoleLine> {

@@ -209,7 +209,7 @@ fn the_dom_surface_an_application_walks() {
            document.querySelector('#out').textContent = \
              'first=' + s.firstElementChild.textContent + \
              ' count=' + s.childElementCount + \
-             ' attrs=' + s.attributes.map(a => a.name).join('|') + \
+             ' attrs=' + Array.from(s.attributes).map(a => a.name).join('|') + \
              ' rel=' + link.getAttribute('rel') + \
              ' anims=' + s.getAnimations().length + \
              ' type=' + document.contentType;\
@@ -640,14 +640,156 @@ fn serialising_markup_keeps_comments_and_escapes_what_it_must() {
     );
 
     reading.assert_clean("serialising markup");
-    // The separator survives...
-    reading.assert_shows("comment=<a href=\"/r\">v<!---->1.0.0</a>");
+    // The separator survives, with what was written in it: an empty `<!---->`
+    // is a different marker to React than the `<!-- -->` this page sent.
+    reading.assert_shows("comment=<a href=\"/r\">v<!-- -->1.0.0</a>");
     // ...void elements do not grow a closing tag...
     reading.assert_shows("void=<img src=\"/x.png\" alt=\"a &amp; b\"><br>");
     // ...text that would reopen markup is escaped...
     reading.assert_shows("text=<p>5 &lt; 6 &amp;&amp; 7</p>");
     // ...and re-parsing the result gives back text, comment, text.
     reading.assert_shows("roundtrip=3,8,3");
+}
+
+/// A comment node keeps what was written in it.
+///
+/// Next.js marks its Suspense boundaries with `<!--$-->` and `<!--/$-->`, and
+/// React matches those against the tree it is hydrating. The parser keeps the
+/// node and drops the text, so every marker read as empty, hydration could
+/// never match, and React rebuilt the whole application on the client.
+#[test]
+fn a_parsed_comment_keeps_its_text() {
+    let reading = read(
+        "<html><body><div id='a'>x<!--$-->y<!--/$-->z</div><output id='out'></output>\
+         <script>\
+           const kids = Array.from(document.querySelector('#a').childNodes);\
+           document.querySelector('#out').textContent = \
+             'data=' + kids.map((n) => n.nodeType + ':' + n.data).join(',');\
+         </script></body></html>",
+    );
+
+    reading.assert_clean("comment text");
+    reading.assert_shows("data=3:x,8:$,3:y,8:/$,3:z");
+}
+
+/// A `<` before non-ASCII text does not take the engine down.
+///
+/// Recovering a comment's text scans the source for raw-text elements, comparing
+/// `rest[..name.len()]` on a `&str`. Any `<` with multi-byte text after it put
+/// that boundary inside a character, and slicing there panics: vercel.com killed
+/// the engine thread. Only pages that also had a comment reached the scan.
+#[test]
+fn a_page_may_put_a_bare_angle_bracket_before_non_ascii() {
+    let reading = read(
+        "<html><body><!--m--><p id='a'>x &lt; \u{65e5}\u{672c}\u{8a9e}</p>\
+         <div id='b'><!--$-->y</div><output id='out'></output>\
+         <script>\
+           document.querySelector('#out').textContent =\
+             'said=' + document.querySelector('#b').firstChild.data;\
+         </script></body></html>",
+    );
+
+    reading.assert_clean("a bare angle bracket");
+    // The comment after it still gets its text, so the scan did not just bail.
+    reading.assert_shows("said=$");
+}
+
+/// `<!--` inside a `<script>` opens no comment.
+///
+/// The text is found again by reading the source the parser was given, so a
+/// scan that took this for a comment would have one more than the tree does
+/// and put every later comment's text on the wrong node.
+#[test]
+fn markup_inside_a_script_does_not_shift_comment_text() {
+    let reading = read(
+        "<html><body><script>var marker = \"<!--decoy-->\";</script>\
+         <div id='a'><!--real--></div><output id='out'></output>\
+         <script>\
+           document.querySelector('#out').textContent = \
+             'said=' + document.querySelector('#a').firstChild.data;\
+         </script></body></html>",
+    );
+
+    reading.assert_clean("comment beside a script");
+    reading.assert_shows("said=real");
+}
+
+/// A `load` fired at an element reaches the document and stops there.
+///
+/// DOM 2.9 gives a Document no parent for this one type, so the window never
+/// hears a subresource finish. Sentry's bundled web-vitals installs a fresh
+/// capturing `load` listener every time it runs, so delivering these grew them
+/// quadratically: 68 subresources became 2,336 callbacks on grok.com.
+#[test]
+fn a_subresource_load_does_not_reach_the_window() {
+    let reading = read(
+        "<html><body><svg id='s'></svg><output id='out'></output>\
+         <script>\
+           const seen = [];\
+           addEventListener('load', (e) => seen.push('w:' + e.target.tagName), true);\
+           document.querySelector('#s').addEventListener('load', () => seen.push('svg'));\
+           addEventListener('load', () => {\
+             document.querySelector('#out').textContent = 'heard=' + seen.join(',');\
+           });\
+         </script></body></html>",
+    );
+
+    reading.assert_clean("subresource load");
+    reading.assert_shows("heard=svg,w:HTML");
+}
+
+/// `PerformanceObserver` exists, and says only what it can deliver.
+///
+/// Sentry's tracing integration constructs one during its own `setup` without
+/// checking for it, so the missing global was the first thing grok.com threw.
+/// `supportedEntryTypes` is the honest half: a library reads it to decide what
+/// to watch, and naming a type that never arrives would leave `onLCP` waiting
+/// for a metric that is not coming.
+#[test]
+fn a_performance_observer_reports_only_the_entries_it_can_deliver() {
+    let reading = read(
+        "<html><body><output id='out'></output>\
+         <script>\
+           const seen = [];\
+           const observer = new PerformanceObserver((list) => {\
+             for (const entry of list.getEntries()) seen.push(entry.entryType + ':' + entry.name);\
+           });\
+           observer.observe({ entryTypes: ['mark', 'measure', 'largest-contentful-paint'] });\
+           performance.mark('a');\
+           performance.mark('b');\
+           performance.measure('m', 'a', 'b');\
+           setTimeout(() => {\
+             document.querySelector('#out').textContent = \
+               'supports=' + PerformanceObserver.supportedEntryTypes.join('+') +\
+               ' saw=' + seen.join(',');\
+           }, 0);\
+         </script></body></html>",
+    );
+
+    reading.assert_clean("performance observer");
+    reading.assert_shows("supports=mark+measure saw=mark:a,mark:b,measure:m");
+}
+
+/// `screen` answers rather than being absent.
+///
+/// Mixpanel reads `screen.height` while building an event's properties. With no
+/// `screen` at all that was a TypeError no browser produces, it escaped into
+/// React, and grok.com rendered its root error boundary instead of the page.
+#[test]
+fn a_page_can_read_the_display_size() {
+    let reading = read(
+        "<html><body><output id='out'></output>\
+         <script>\
+           document.querySelector('#out').textContent =\
+             'wh=' + (screen.width === innerWidth) + (screen.height === innerHeight) +\
+             ' avail=' + (screen.availWidth === screen.width) +\
+             ' depth=' + screen.colorDepth +\
+             ' tag=' + Object.prototype.toString.call(screen);\
+         </script></body></html>",
+    );
+
+    reading.assert_clean("display size");
+    reading.assert_shows("wh=truetrue avail=true depth=24 tag=[object Screen]");
 }
 
 /// The legacy surface every browser implements. Annex B is the standard's own

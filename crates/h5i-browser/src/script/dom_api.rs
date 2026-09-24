@@ -126,6 +126,9 @@ pub fn install(context: &mut Context) -> JsResult<()> {
         ("removeAttr", 2, remove_attr),
         ("tagName", 1, tag_name),
         ("children", 1, children),
+        ("childCount", 1, child_count),
+        ("childAt", 2, child_at),
+        ("siblingOf", 2, sibling_of),
         ("parent", 1, parent),
         ("isElement", 1, is_element),
         ("root", 0, root),
@@ -135,6 +138,7 @@ pub fn install(context: &mut Context) -> JsResult<()> {
         ("setValue", 2, set_value),
         ("log", 2, log),
         ("unsupported", 1, unsupported),
+        ("runScript", 2, run_script),
         ("fetchStart", 6, fetch_start),
         ("fetchDrain", 0, fetch_drain),
         ("fetchPending", 0, fetch_pending),
@@ -387,11 +391,80 @@ fn children(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResul
         let doc = host.dom.borrow();
         doc.get_node(id).map(|n| n.children.clone()).unwrap_or_default()
     };
-    let array = boa_engine::object::builtins::JsArray::new(context)?;
-    for child in ids {
-        array.push(JsValue::from(child as f64), context)?;
+    // Built in one step rather than pushed element by element: `push` runs the
+    // whole of `Array.prototype.push` per child, reading and writing `length`
+    // each time, and this is the most-called primitive on the list.
+    Ok(boa_engine::object::builtins::JsArray::from_iter(
+        ids.into_iter().map(|child| JsValue::from(child as f64)),
+        context,
+    )
+    .into())
+}
+
+/// How many children a node has.
+///
+/// One number instead of the array `hasChildNodes` used to build and throw away.
+fn child_count(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let id = arg_id(args, 0, context)?;
+    let host = host(context)?;
+    let doc = host.dom.borrow();
+    let count = doc.get_node(id).map_or(0, |n| n.children.len());
+    Ok(JsValue::from(count as f64))
+}
+
+/// The child at `index`, or null. Negative counts back from the end, so `-1` is
+/// the last child.
+///
+/// `firstChild` and `lastChild` used to read the whole child list, wrap every
+/// node in it and take one: a node with a hundred children cost a hundred
+/// wrappers to answer a question about one of them.
+fn child_at(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let id = arg_id(args, 0, context)?;
+    let index = args
+        .get(1)
+        .and_then(boa_engine::JsValue::as_number)
+        .unwrap_or(0.0) as i64;
+    let host = host(context)?;
+    let doc = host.dom.borrow();
+    let Some(node) = doc.get_node(id) else {
+        return Ok(JsValue::null());
+    };
+    let len = node.children.len() as i64;
+    let at = if index < 0 { len + index } else { index };
+    if at < 0 || at >= len {
+        return Ok(JsValue::null());
     }
-    Ok(array.into())
+    Ok(id_value(Some(node.children[at as usize])))
+}
+
+/// The sibling `offset` places from this node, or null.
+///
+/// The position is found here rather than in the page, where finding it meant
+/// building the parent's whole child list and searching it for this node: a
+/// walk along N siblings was N array allocations and N² wrappers, and React's
+/// reconciler walks sibling chains constantly.
+fn sibling_of(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let id = arg_id(args, 0, context)?;
+    let offset = args
+        .get(1)
+        .and_then(boa_engine::JsValue::as_number)
+        .unwrap_or(0.0) as i64;
+    let host = host(context)?;
+    let doc = host.dom.borrow();
+    let Some(parent) = doc.get_node(id).and_then(|n| n.parent) else {
+        return Ok(JsValue::null());
+    };
+    let Some(siblings) = doc.get_node(parent).map(|n| &n.children) else {
+        return Ok(JsValue::null());
+    };
+    let Some(at) = siblings.iter().position(|child| *child == id) else {
+        return Ok(JsValue::null());
+    };
+    let want = at as i64 + offset;
+    if want < 0 || want >= siblings.len() as i64 {
+        return Ok(JsValue::null());
+    }
+    Ok(id_value(Some(siblings[want as usize])))
 }
 
 fn parent(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -1235,10 +1308,61 @@ fn identity(_this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResu
 /// `fetch` calls actually overlap instead of running one after the other. The
 /// old binding did the whole round trip inline, so a page that fanned out ten
 /// requests paid for them in series and every SPA waterfall was our own.
+/// Run a page's script as a *script*, in the realm's global scope.
+///
+/// `eval` does not scope alike: a top-level `let` or `class` inside an indirect
+/// `eval` is gone when it returns, where in a script it joins the global
+/// environment every later script reads. Every chunk loader splits declarations
+/// across files, and lost all of them to "access of uninitialized binding". The
+/// name is the script's URL, so a stack names the file.
+fn run_script(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let code = arg_string(args, 0, context).unwrap_or_default();
+    let name = arg_string(args, 1, context).unwrap_or_default();
+    let source = boa_engine::Source::from_reader(
+        code.as_bytes(),
+        Some(std::path::Path::new(&name)),
+    );
+    context.eval(source)
+}
+
+/// The request body as the bytes it is.
+///
+/// A page may hand `fetch` a typed array or an `ArrayBuffer` — every protobuf
+/// and gRPC-web client does — and coercing one to a string turned a five-byte
+/// frame into `{"0":0,"1":0,...}`. The server read `{` as the frame's
+/// compression flag and refused the request it had just been sent.
+fn arg_body(args: &[JsValue], at: usize, context: &mut Context) -> Vec<u8> {
+    use boa_engine::object::builtins::{JsArrayBuffer, JsTypedArray};
+
+    if let Some(object) = args.get_or_undefined(at).as_object() {
+        // A view carries an offset and a length into a buffer it shares, and
+        // sending the whole buffer would send whatever else is in it.
+        if let Ok(view) = JsTypedArray::from_object(object.clone()) {
+            let offset = view.byte_offset(context).unwrap_or(0);
+            let length = view.byte_length(context).unwrap_or(0);
+            if let Ok(buffer) = view.buffer(context)
+                && let Some(buffer) = buffer.as_object()
+                && let Ok(buffer) = JsArrayBuffer::from_object(buffer.clone())
+                && let Some(data) = buffer.data()
+            {
+                let start = offset.min(data.len());
+                let end = offset.saturating_add(length).min(data.len());
+                return data[start..end].to_vec();
+            }
+        }
+        if let Ok(buffer) = JsArrayBuffer::from_object(object.clone())
+            && let Some(data) = buffer.data()
+        {
+            return data.to_vec();
+        }
+    }
+    arg_string(args, at, context).unwrap_or_default().into_bytes()
+}
+
 fn fetch_start(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let target = arg_string(args, 0, context)?;
     let method = arg_string(args, 1, context).unwrap_or_else(|_| "GET".to_string());
-    let body = arg_string(args, 2, context).unwrap_or_default();
+    let body = arg_body(args, 2, context);
     // The rest of the request's origin story: what the page set, and how it
     // asked to treat the boundary. Defaults match `fetch`'s own (`cors` mode,
     // `same-origin` credentials) so a page that says nothing gets the
@@ -1302,7 +1426,7 @@ fn fetch_start(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRe
                     (!body.is_empty())
                         .then(|| "application/x-www-form-urlencoded".to_string())
                 }),
-            body: body.into_bytes(),
+            body,
             headers,
             mode,
             credentials,
@@ -1470,6 +1594,12 @@ fn reply_value(
     }
 
     let status = outcome.status.unwrap_or(0);
+    // `text()` is *defined* as a UTF-8 decode with replacement characters, so
+    // the lossy string is the right answer there. It is the wrong answer for
+    // `arrayBuffer()` and `blob()`, which owe the page the bytes that arrived:
+    // a protobuf frame decoded and re-encoded this way comes back mangled, and
+    // a Connect API reads its own reply as a protocol error.
+    let exact = std::str::from_utf8(&outcome.body).is_ok();
     let text = String::from_utf8_lossy(&outcome.body).into_owned();
     let reply = boa_engine::object::ObjectInitializer::new(context).build();
     reply.set(js_string!("ok"), (200..300).contains(&status), false, context)?;
@@ -1482,6 +1612,16 @@ fn reply_value(
     let seen_url = if outcome.opaque { String::new() } else { outcome.final_url.to_string() };
     reply.set(js_string!("url"), js_string!(seen_url), false, context)?;
     reply.set(js_string!("text"), js_string!(text), false, context)?;
+    // Only when the decode lost something. A body that is valid UTF-8 encodes
+    // back to exactly the bytes it came as, so carrying them a second time
+    // would be memory spent to say what `text` already says.
+    if !exact {
+        let bytes = boa_engine::object::builtins::JsUint8Array::from_iter(
+            outcome.body.iter().copied(),
+            context,
+        )?;
+        reply.set(js_string!("bytes"), bytes, false, context)?;
+    }
 
     let headers = boa_engine::object::builtins::JsArray::new(context)?;
     for (name, value) in &outcome.headers {
@@ -1964,6 +2104,27 @@ fn computed_style(_this: &JsValue, args: &[JsValue], context: &mut Context) -> J
     // tree* built, not what the cascade computed.
 
     use style::properties::{PropertyDeclarationId, PropertyId};
+    // `overflow` is a shorthand, and the rule below declines shorthands on
+    // purpose. This one earns an exception: everything that hunts for a scroll
+    // container reads it, and unlike `border` its computed value is not a
+    // judgement call — CSSOM says the two longhands, written as one when they
+    // agree. Declining it told a library the element had no overflow at all.
+    if property == "overflow" {
+        let longhand = |name: &str| {
+            PropertyId::parse_enabled_for_all_content(name)
+                .ok()
+                .and_then(|id| match id {
+                    PropertyId::NonCustom(id) => id.as_longhand(),
+                    PropertyId::Custom(_) => None,
+                })
+                .map(|l| styles.computed_value_to_string(PropertyDeclarationId::Longhand(l)))
+        };
+        if let (Some(x), Some(y)) = (longhand("overflow-x"), longhand("overflow-y")) {
+            let value = if x == y { x } else { format!("{x} {y}") };
+            return Ok(js_string!(value).into());
+        }
+    }
+
     let answer = match PropertyId::parse_enabled_for_all_content(&property) {
         // A shorthand resolves to `None` here and so names itself: its computed
         // value is its longhands re-serialised, and getting that subtly wrong is
@@ -2795,4 +2956,32 @@ fn sse_drain(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
     }
 
     Ok(out.into())
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+    use boa_engine::object::builtins::JsUint8Array;
+
+    /// A body that is bytes reaches the wire as those bytes.
+    ///
+    /// Coercing one to a string turned a five-byte gRPC-web frame into
+    /// `{"0":0,"1":0,...}`, and the server read `{` as the frame's compression
+    /// flag and refused the request it had just been handed.
+    #[test]
+    fn a_typed_array_body_keeps_its_bytes() {
+        let context = &mut Context::default();
+        let frame = [0u8, 0, 0, 0, 5, 0x80, 0xff];
+        let array = JsUint8Array::from_iter(frame.iter().copied(), context).expect("array");
+        let got = arg_body(&[array.into()], 0, context);
+        assert_eq!(got, frame, "the bytes the page passed are the bytes sent");
+    }
+
+    /// Text is still text: the common body is a string and must not change.
+    #[test]
+    fn a_string_body_is_still_its_utf8() {
+        let context = &mut Context::default();
+        let got = arg_body(&[js_string!("hello").into()], 0, context);
+        assert_eq!(got, b"hello");
+    }
 }

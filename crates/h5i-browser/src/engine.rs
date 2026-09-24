@@ -335,6 +335,105 @@ impl blitz_traits::navigation::NavigationProvider for CapturedNavigation {
 pub type Dom = Rc<RefCell<BaseDocument>>;
 
 /// A loaded, resolved document.
+/// Elements whose content the tokenizer reads as raw text, where `<!--` opens
+/// no comment.
+const RAW_TEXT_ELEMENTS: [&str; 8] = [
+    "script", "style", "textarea", "title", "xmp", "noembed", "noframes", "iframe",
+];
+
+/// What each comment node in `doc` said, read back out of `html`.
+///
+/// Paired by position, and only when both sides found the same number: a scan is
+/// not a parser, and one comment too many would put every later comment's text
+/// on the wrong node.
+fn recover_comments(html: &str, doc: &blitz_dom::BaseDocument) -> std::collections::HashMap<usize, String> {
+    let ids = comment_nodes(doc);
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let texts = comment_texts(html);
+    if texts.len() != ids.len() {
+        return std::collections::HashMap::new();
+    }
+    ids.into_iter().zip(texts).collect()
+}
+
+/// Every comment node under the document, in tree order.
+fn comment_nodes(doc: &blitz_dom::BaseDocument) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut stack = vec![doc.root_node().id];
+    // Reversed on push, so children are visited left to right.
+    while let Some(id) = stack.pop() {
+        let Some(node) = doc.get_node(id) else {
+            continue;
+        };
+        if matches!(node.data, blitz_dom::NodeData::Comment) {
+            found.push(id);
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    found
+}
+
+/// Every comment in `html`, in source order.
+///
+/// Follows the tokenizer where it matters and not where it does not: raw-text
+/// elements are skipped because `<!--` inside a `<script>` opens no comment,
+/// and a comment ends at `-->`, at `--!>`, or at the end of the input.
+fn comment_texts(html: &str) -> Vec<String> {
+    let bytes = html.as_bytes();
+    let mut found = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let Some(next) = html[at..].find('<') else {
+            break;
+        };
+        let open = at + next;
+        if html[open..].starts_with("<!--") {
+            let body = open + 4;
+            let end = html[body..]
+                .find("-->")
+                .map(|n| (body + n, body + n + 3))
+                .or_else(|| html[body..].find("--!>").map(|n| (body + n, body + n + 4)))
+                .unwrap_or((bytes.len(), bytes.len()));
+            found.push(html[body..end.0].to_string());
+            at = end.1;
+            continue;
+        }
+        at = open + 1;
+        let rest = &html[open + 1..];
+        for name in RAW_TEXT_ELEMENTS {
+            // Compared as bytes. `rest` can begin mid-character — any `<` with
+            // non-ASCII after it — and slicing a `str` by a byte length that
+            // lands inside one panics, which took the engine down on any page
+            // that had both a comment and a `<` before non-ASCII text. A
+            // successful ASCII compare is also what proves `name.len()` is a
+            // character boundary, so the slice below it is safe.
+            let head = rest.as_bytes();
+            if head.len() < name.len()
+                || !head[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+                || !rest[name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_whitespace() || c == '>' || c == '/')
+            {
+                continue;
+            }
+            let Some(gt) = rest.find('>') else {
+                return found;
+            };
+            let after = open + 1 + gt + 1;
+            let close = format!("</{name}");
+            at = match html[after..].to_ascii_lowercase().find(&close) {
+                Some(n) => after + n + close.len(),
+                None => bytes.len(),
+            };
+            break;
+        }
+    }
+    found
+}
+
 pub struct Page {
     doc: Dom,
     url: Url,
@@ -372,6 +471,13 @@ pub struct Page {
     /// A page with no script elements never gets one, so `script.is_some()`
     /// alone cannot tell "script is off" from "there was nothing to run".
     ran_scripts: bool,
+    /// What each parsed comment node actually said, by node id.
+    ///
+    /// Blitz stores `NodeData::Comment` as a unit variant, so the text is lost at
+    /// parse time. Next.js marks Suspense boundaries with `<!--$-->`, and React
+    /// cannot hydrate against markers that all read as empty.
+    parsed_comments: std::collections::HashMap<usize, String>,
+
     /// Set when the layout engine panicked while reading this page.
     ///
     /// The outline that follows was produced from whatever state layout reached,
@@ -976,10 +1082,13 @@ impl Page {
             notes.push(SESSION_DROPPED_NOTE.to_string());
         }
 
+        let parsed_comments = recover_comments(html, &doc);
+
         Self {
             // Assumed until `from_bytes` says otherwise: a string handed
             // straight to `from_html` has already been decoded by someone.
             encoding: encoding_rs::UTF_8,
+            parsed_comments,
             doc: Rc::new(RefCell::new(doc)),
             url: base_url.clone(),
             // Armed here rather than at the script phase, so the fetching and
@@ -1138,6 +1247,7 @@ impl Page {
         )
         .map_err(H5iError::Metadata)?;
         script.set_encoding(self.encoding);
+        script.seed_comments(self.parsed_comments.clone());
         // Shared, not copied: the document keeps filling this in as script adds
         // images and frames.
         script.set_resource_log(self.resources.clone());
@@ -1210,8 +1320,54 @@ impl Page {
         // without this it is the one subresource the page never hears about.
         let resources = self.resources.clone();
 
+        // One script's body is asked for while the script before it runs, so
+        // `pending` holds one fetched and not yet run. The request still goes out
+        // first and in document order, so the request log is unchanged; what
+        // overlaps is the wait. `Broker::send_while` defaults to a plain send, so
+        // an in-process broker runs exactly as it did.
+        let mut pending: Option<(usize, String, String)> = None;
+        let run_pending = |script: &mut crate::script::Script,
+                               pending: &mut Option<(usize, String, String)>| {
+            let Some((node, where_from, code)) = pending.take() else {
+                return;
+            };
+            script.set_current_script(Some(node));
+            let at = std::time::Instant::now();
+            let ran = script.eval_named(&code, &where_from);
+            if crate::script::timing_page() {
+                eprintln!(
+                    "PAGE_TIME script {:>8.1}ms {:>8} bytes {}",
+                    at.elapsed().as_secs_f64() * 1000.0,
+                    code.len(),
+                    where_from
+                );
+            }
+            // Before `currentScript` is cleared, which is where HTML puts it:
+            // the checkpoint is inside "run a classic script", and only the
+            // step *after* that restores the element. So a continuation this
+            // script queued still sees the script it came from — which is how
+            // a chunk loader that awaits before instantiating finds its own
+            // tag. Clearing first read as "no script is running" and every
+            // such loader failed.
+            script.microtask_checkpoint();
+            script.set_current_script(None);
+            if let Err(error) = ran {
+                // Reported, not fatal: a page with one broken script is still a
+                // page, and the agent needs to know which half it is reading.
+                //
+                // Recorded as not-run too: a bundle that threw halfway leaves
+                // its globals undefined exactly as a refused one does, and the
+                // ReferenceError that follows should blame this, not the engine.
+                script.note_refused_script(&where_from);
+                script.note_error(&format!("{where_from}: {error}"));
+            }
+        };
+
         for (index, (node, source)) in classic.into_iter().enumerate() {
             if phase_started.elapsed() >= phase_budget {
+                // What was already fetched still runs: it cost a round trip
+                // and the page is entitled to it.
+                run_pending(&mut script, &mut pending);
                 skipped += 1;
                 continue;
             }
@@ -1224,13 +1380,18 @@ impl Page {
                 _ => format!("inline script #{}", index + 1),
             };
             let code = match source {
-                Source::Inline(text) => text,
+                Source::Inline(text) => {
+                    // Nothing on the wire to hide behind.
+                    run_pending(&mut script, &mut pending);
+                    text
+                }
                 Source::External(src) => {
                     // Fetched through the broker like every other subresource,
                     // so a script file is policy-checked and receipted before it
                     // is ever executed. A refusal is reported and the page runs
                     // without it, which is what the agent needs to know.
                     let Ok(url) = self.url.join(&src) else {
+                        run_pending(&mut script, &mut pending);
                         script.note_error(&format!("script src `{src}` is not a URL"));
                         continue;
                     };
@@ -1239,11 +1400,14 @@ impl Page {
                     // policy read it as the agent naming a URL, so a page from
                     // the open web could point a `<script src>` at the box's
                     // dev server and run whatever came back.
-                    let outcome = broker.fetch_from(
+                    let ask = crate::broker::Fetch::get(
                         &url,
                         crate::receipt::Initiator::Subresource,
-                        Some(&document),
-                    );
+                    )
+                    .from_document(Some(&document));
+                    let outcome = broker.send_while(&ask, &mut || {
+                        run_pending(&mut script, &mut pending);
+                    });
                     if let Ok(mut log) = resources.lock() {
                         log.record(&url, &outcome);
                     }
@@ -1267,27 +1431,27 @@ impl Page {
                 _ => unreachable!("partitioned above"),
             };
 
-            script.set_current_script(Some(node));
-            if let Err(error) = script.eval_named(&code, &where_from) {
-                // Reported, not fatal: a page with one broken script is still a
-                // page, and the agent needs to know which half it is reading.
-                //
-                // Recorded as not-run too: a bundle that threw halfway leaves
-                // its globals undefined exactly as a refused one does, and the
-                // ReferenceError that follows should blame this, not the engine.
-                script.note_refused_script(&where_from);
-                script.note_error(&format!("{where_from}: {error}"));
-            }
+            // Not conditional on the closure above having run: `send_while`
+            // defaults to a plain send and ignores it, so this is what actually
+            // guarantees document order. It is a no-op when the overlap did
+            // happen, because the slot has already been taken.
+            run_pending(&mut script, &mut pending);
+            pending = Some((node, where_from, code));
         }
-        // Null again once the classic scripts are done, because that is what a
-        // module and a later callback are supposed to see.
-        script.set_current_script(None);
+        // The last one has nothing after it to hide behind.
+        run_pending(&mut script, &mut pending);
 
         // One budget for the whole phase, not one per stage. The settle used to
         // arm a fresh deadline of its own, so a page that spent the script
         // budget and then the job budget cost the sum of the two. Lit.dev took
         // 46 seconds against a 20-second intent. What is left of the phase is
         // what settling gets.
+        if crate::script::timing_page() {
+            eprintln!(
+                "PAGE_TIME classic-scripts {:.1}ms",
+                phase_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let left = phase_budget.saturating_sub(phase_started.elapsed());
         script.set_job_budget(left.max(std::time::Duration::from_secs(1)));
 

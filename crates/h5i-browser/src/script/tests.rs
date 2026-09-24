@@ -1568,6 +1568,137 @@ fn element_scoped_queries_do_not_escape_their_element() {
 
 // ── the vertical slice: a page that fetches and re-renders ─────────────────
 
+/// Every tier the eager prelude loads by name is a tier that exists.
+///
+/// A name `TIERS` does not carry fails the whole prelude, so the page gets no
+/// script at all. `screen` was registered behind the `identity` feature while the
+/// prelude asked for it unconditionally, which broke every page of the
+/// `--no-default-features` build and nothing in the default one.
+#[test]
+fn the_prelude_only_asks_for_tiers_that_exist() {
+    let named: Vec<&str> = super::PRELUDE
+        .match_indices("__h5iTier(\"")
+        .filter_map(|(at, pat)| {
+            let rest = &super::PRELUDE[at + pat.len()..];
+            rest.find('"').map(|end| &rest[..end])
+        })
+        .collect();
+
+    assert!(
+        !named.is_empty(),
+        "the scan found no `__h5iTier(\"…\")` call, so it is no longer checking anything"
+    );
+    for name in named {
+        assert!(
+            super::TIERS.iter().any(|(tier, _)| *tier == name),
+            "the prelude loads a `{name}` tier that `TIERS` does not carry in this \
+             feature configuration, so the prelude will refuse to start"
+        );
+    }
+}
+
+/// A server that reports back the request line, content type and body it saw.
+fn echoing_server() -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..1 {
+            let Ok((stream, _)) = listener.accept() else { return };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let mut content_type = String::new();
+            let mut length = 0usize;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
+                    break;
+                }
+                // The name is matched without case, the value kept with it: a
+                // multipart boundary is case-sensitive and has to match the body.
+                let name = header.split(':').next().unwrap_or("").to_ascii_lowercase();
+                let value = header.split_once(':').map(|(_, v)| v.trim().to_string());
+                match (name.as_str(), value) {
+                    ("content-type", Some(v)) => content_type = v,
+                    ("content-length", Some(v)) => length = v.parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+            let mut raw = vec![0u8; length];
+            let _ = reader.read_exact(&mut raw);
+            // The boundary is random, so the reply names what the test can
+            // assert on rather than the bytes themselves.
+            let seen = String::from_utf8_lossy(&raw);
+            let multipart = content_type.starts_with("multipart/form-data; boundary=");
+            let boundary = content_type
+                .rsplit("boundary=")
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let body = format!(
+                "{{\"multipart\":{multipart},\"opens\":{},\"blobBytes\":{},\"named\":{},\"plain\":{}}}",
+                !boundary.is_empty() && seen.starts_with(&format!("--{boundary}")),
+                seen.contains("hi"),
+                seen.contains("filename=\"b.txt\""),
+                seen.contains("name=\"a\"")
+            );
+            let mut stream = stream;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.flush();
+        }
+    });
+    (port, handle)
+}
+
+/// A `FormData` body goes out as `multipart/form-data`, carrying its bytes.
+///
+/// It used to go as `application/x-www-form-urlencoded`, which no browser sends
+/// for one and which cannot carry a `Blob` at all: `FormData.append` stringified
+/// every value, so React's server-action payload reached grok.com as the eight
+/// characters `[object Object]` and its server answered 500. The page then
+/// retried its session init and rendered an error toast instead of itself.
+#[test]
+fn a_form_data_body_is_sent_as_multipart() {
+    let (port, server) = echoing_server();
+    let broker = crate::net::LocalBroker::new(Policy::new(), Arc::new(MemorySink::new()), None)
+        .expect("broker");
+    let fonts = crate::fonts::load(&[], &crate::fonts::default_font_dirs(), Some(2));
+    let options = PageOptions { script: true, ..Default::default() };
+    let factory = PageFactory::new(broker, fonts.sources.clone(), options);
+    let base = url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+    let page = factory.from_html(
+        "<html><body><output id='out'></output>\
+         <script>\
+           const form = new FormData();\
+           form.append('a', 'plain');\
+           form.append('b', new Blob([new Uint8Array([104, 105])], { type: 'text/plain' }), 'b.txt');\
+           fetch('/echo', { method: 'POST', body: form })\
+             .then((r) => r.text())\
+             .then((t) => { document.querySelector('#out').textContent = t; });\
+         </script></body></html>",
+        &base,
+    );
+
+    let shown = page.snapshot().render();
+    assert!(
+        shown.contains("\"multipart\":true")
+            && shown.contains("\"opens\":true")
+            && shown.contains("\"blobBytes\":true")
+            && shown.contains("\"named\":true")
+            && shown.contains("\"plain\":true"),
+        "the form should reach the wire as multipart with its blob intact:\n{shown}"
+    );
+    let _ = server.join();
+}
+
 /// A server with an API the page's script calls.
 fn api_server() -> (u16, std::thread::JoinHandle<()>) {
     use std::io::{BufRead, BufReader, Write};
@@ -3778,7 +3909,29 @@ fn the_eagerly_parsed_prelude_stays_within_its_budget() {
     // properties: the pair jQuery 1.x feature-detects on its way in. Neither is
     // tierable — both are read before any page code runs — and without them the
     // library threw before defining `$`, which is every page written against it.
-    const BUDGET_KIB: usize = 284;
+    //
+    // 288 to make that NamedNodeMap *live*, with the attribute-node family
+    // beside it: React clears an element it re-hydrates through
+    // `removeAttributeNode`, and over a snapshot that never terminates.
+    //
+    // 289 for `document.fonts` and `navigator.sendBeacon`, read off objects the
+    // core already hands out, so no tier can hold them.
+    //
+    // 290 to carry a body as bytes both ways. A typed array was stringified to
+    // `{"0":0,...}` and `arrayBuffer()` re-encoded a lossy decode, so no binary
+    // round trip survived and a gRPC-web API called its own frames malformed.
+    //
+    // 291 to give a computed style the rest of its interface. The proxy answered
+    // unknown names with a *value*, so `item` and `setProperty` became `""` and
+    // calling one threw "not a callable function".
+    //
+    // 292 for `dispatchEvent` on `document` and on an `AbortSignal`: both had
+    // `addEventListener` already, so both were half an EventTarget.
+    //
+    // 293 for the `PerformanceObserver` hook and an always-present `screen`. The
+    // observer is a tier; eager is the four lines `performance` needs to offer it
+    // an entry. `screen` reading as absent threw a TypeError no browser does.
+    const BUDGET_KIB: usize = 293;
 
     assert!(
         !super::PRELUDE.contains("/*"),
@@ -4485,7 +4638,7 @@ fn an_api_this_engine_lacks_names_itself_instead_of_throwing_anonymously() {
     script
         .eval(
             "globalThis.said = ''; \
-             try { indexedDB.open('db') } catch (e) { said = String(e) } \
+             try { caches.open('v1') } catch (e) { said = String(e) } \
              void navigator.clipboard;",
         )
         .expect("runs");
@@ -4493,7 +4646,7 @@ fn an_api_this_engine_lacks_names_itself_instead_of_throwing_anonymously() {
     // A global this engine lacks throws by its own name, which is what the
     // ReferenceError parser reads back.
     assert!(
-        script.eval_value("said").unwrap().contains("indexedDB"),
+        script.eval_value("said").unwrap().contains("caches"),
         "the message names what was wanted: {}",
         script.eval_value("said").unwrap()
     );
@@ -5113,12 +5266,17 @@ fn an_unknown_property_on_an_element_names_itself() {
 fn an_unknown_property_on_document_names_itself() {
     let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
 
-    assert_eq!(script.eval_value("typeof document.fonts").unwrap(), "undefined");
+    // A real API this engine does not have. It was `document.fonts` until that
+    // one arrived; what is under test is the naming, not which API is absent.
+    assert_eq!(
+        script.eval_value("typeof document.startViewTransition").unwrap(),
+        "undefined"
+    );
     assert!(
         script
             .unsupported()
             .iter()
-            .any(|(name, _)| name == "document.fonts"),
+            .any(|(name, _)| name == "document.startViewTransition"),
         "{:?}",
         script.unsupported()
     );
@@ -6197,7 +6355,10 @@ fn the_bare_build_answers_what_native_declares() {
     assert_eq!(reported(&mut script, "navigator.hardwareConcurrency"), "1");
     assert_eq!(reported(&mut script, "navigator.maxTouchPoints"), "0");
     assert_eq!(reported(&mut script, "navigator.languages.join(',')"), "en-US,en");
-    assert_eq!(reported(&mut script, "typeof screen"), "undefined");
+    // `screen` is not part of the fallback literal: it answers from the
+    // viewport rather than from the identity when nothing is declared. See
+    // `the_default_identity_leaves_the_page_exactly_as_it_was`.
+    assert_eq!(reported(&mut script, "typeof screen"), "object");
 }
 
 #[test]
@@ -6215,12 +6376,29 @@ fn the_default_identity_leaves_the_page_exactly_as_it_was() {
     assert_eq!(script.eval_value("navigator.maxTouchPoints").unwrap(), "0");
     assert_eq!(script.eval_value("navigator.vendor").unwrap(), "");
     assert_eq!(script.eval_value("devicePixelRatio").unwrap(), "1");
-    // No display is declared, so there is none to report, which is what this
-    // engine did before an identity existed, and for the same reason: a
-    // headless engine's honest screen size is a guess.
-    assert_eq!(script.eval_value("typeof screen").unwrap(), "undefined");
-    assert_eq!(script.eval_value("'screen' in globalThis").unwrap(), "false");
-    assert_eq!(script.eval_value("typeof Screen").unwrap(), "undefined");
+    // No display is declared, so `screen` reports the viewport this page was laid
+    // out at. It used to be absent, on the rule that a headless engine's screen
+    // size is a guess — but the absence threw a TypeError no browser produces,
+    // and the viewport is the size this engine really used.
+    assert_eq!(script.eval_value("typeof screen").unwrap(), "object");
+    assert_eq!(script.eval_value("typeof Screen").unwrap(), "function");
+    assert_eq!(
+        script.eval_value("screen.width === innerWidth").unwrap(),
+        "true"
+    );
+    assert_eq!(
+        script.eval_value("screen.height === innerHeight").unwrap(),
+        "true"
+    );
+    assert_eq!(
+        script.eval_value("screen.availWidth === screen.width").unwrap(),
+        "true"
+    );
+    assert_eq!(script.eval_value("screen.colorDepth").unwrap(), "24");
+    assert_eq!(
+        script.eval_value("screen.pixelDepth === screen.colorDepth").unwrap(),
+        "true"
+    );
 }
 
 #[cfg(feature = "identity")]
@@ -6465,9 +6643,15 @@ fn the_element_walk_and_attribute_list_answer() {
         "EM"
     );
 
-    // Attributes, in source order, with a name lookup.
+    // Attributes, in source order, with a name lookup. Through `Array.from`
+    // because the map is a `NamedNodeMap` and not an array: a browser has no
+    // `.map` here either, and the loop React clears an element with needs the
+    // live map rather than the snapshot that shape used to imply.
     assert_eq!(
-        script.eval_value("document.querySelector('#d').attributes.map(a => a.name).join(',')")
+        script
+            .eval_value(
+                "Array.from(document.querySelector('#d').attributes).map(a => a.name).join(',')"
+            )
             .unwrap(),
         "id,class,data-x"
     );
@@ -7500,5 +7684,492 @@ fn a_window_carries_the_global_event_handlers_and_a_named_node_map_is_indexable(
             .eval_value("document.querySelector('#d').attributes.length")
             .unwrap(),
         "2"
+    );
+}
+
+/// `RegExp.prototype.source` has to be a *fixed point* of `new RegExp(source)`.
+///
+/// Every `/` was escaped without noticing one already escaped, so each trip grew
+/// another backslash. Libraries that rewrite patterns do that round trip, and
+/// what they handed back stopped meaning what it said: `^(?:\/)?$` became
+/// `^\(?:\/)?$`, which does not parse.
+#[test]
+fn a_regexp_source_is_unchanged_by_a_round_trip() {
+    let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
+
+    // An escaped `/` stays escaped once, not twice.
+    assert_eq!(script.eval_value(r"/a\/b/.source").unwrap(), r"a\/b");
+    // A bare one still earns its backslash: the source has to be something
+    // `/` and `/` can be wrapped around and re-read.
+    assert_eq!(
+        script.eval_value(r#"new RegExp("a/b").source"#).unwrap(),
+        r"a\/b"
+    );
+    // And the trip is a fixed point rather than a ratchet.
+    assert_eq!(
+        script
+            .eval_value(r"new RegExp(new RegExp(/(?:\/)?/.source).source).source")
+            .unwrap(),
+        r"(?:\/)?"
+    );
+}
+
+/// A getter that replaces itself with its value, read twice through one site.
+///
+/// The property cache filed the slot under the shape the getter left behind, so
+/// the second read called the stored value as though it were still the getter.
+/// Every lazily-built field is written this way. Fixed in the engine fork; this
+/// is here because the page-level symptom is what we would see again.
+#[test]
+fn a_self_replacing_getter_answers_the_same_twice() {
+    let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
+
+    assert_eq!(
+        script
+            .eval_value(
+                "function read(o) { return o.shape; } \
+                 const src = { a: 1, b: 2 }; \
+                 const o = { shape: src }; \
+                 Object.defineProperty(o, 'shape', { configurable: true, get() { \
+                    const v = { ...src }; \
+                    Object.defineProperty(o, 'shape', { value: v, configurable: true }); \
+                    return v; \
+                 } }); \
+                 Object.keys(read(o)).join('') + '|' + Object.keys(read(o)).join('')"
+            )
+            .unwrap(),
+        "ab|ab"
+    );
+}
+
+/// `Intl` exists, because a page that formats a date or a number is every page.
+///
+/// It was absent entirely: the engine built Boa with `default-features = false`
+/// and never turned the builtin back on, so `Intl` was a `ReferenceError` and
+/// an app died on its first formatted timestamp. `Intl.RelativeTimeFormat` is
+/// still missing — Boa does not implement it — which is why this pins what we
+/// do have rather than the whole namespace.
+#[test]
+fn intl_formats_dates_and_numbers() {
+    let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
+
+    assert_eq!(script.eval_value("typeof Intl").unwrap(), "object");
+    assert_eq!(
+        script
+            .eval_value("new Intl.NumberFormat('en-US').format(1234567.89)")
+            .unwrap(),
+        "1,234,567.89"
+    );
+    assert_eq!(
+        script
+            .eval_value(
+                "new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'short', \
+                 day: 'numeric', timeZone: 'UTC' }).format(new Date(Date.UTC(2026, 8, 22)))"
+            )
+            .unwrap(),
+        "Sep 22, 2026"
+    );
+}
+
+/// A database, an index and a cursor, end to end on the settle loop.
+///
+/// `indexedDB` was absent entirely, and for an application that is fatal
+/// rather than degrading: the store is where its state lives, so the page hit
+/// an unhandled rejection before it drew anything. The tier is in memory for
+/// the life of the realm, which is what `localStorage` is here too — what this
+/// pins is that a page which writes and reads back within one run behaves.
+#[test]
+fn indexeddb_stores_reads_and_walks_a_cursor() {
+    let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
+
+    script
+        .eval(
+            "globalThis.out = 'pending'; \
+             const open = indexedDB.open('notes', 1); \
+             open.onupgradeneeded = (e) => { \
+                const store = e.target.result.createObjectStore('items', \
+                    { keyPath: 'id', autoIncrement: true }); \
+                store.createIndex('byTag', 'tag'); \
+             }; \
+             open.onsuccess = () => { \
+                const db = open.result; \
+                const write = db.transaction('items', 'readwrite'); \
+                const items = write.objectStore('items'); \
+                items.add({ tag: 'a', text: 'first' }); \
+                items.add({ tag: 'b', text: 'second' }); \
+                items.add({ tag: 'a', text: 'third' }); \
+                write.oncomplete = () => { \
+                   const read = db.transaction('items'); \
+                   const seen = []; \
+                   const cursor = read.objectStore('items').index('byTag').openCursor(); \
+                   cursor.onsuccess = () => { \
+                      const at = cursor.result; \
+                      if (at) { seen.push(at.key + at.value.id); at.continue(); return; } \
+                      globalThis.out = seen.join(','); \
+                   }; \
+                }; \
+             };",
+        )
+        .expect("runs");
+
+    let settled = script.settle();
+    assert!(!settled.cut_off, "{settled:?}");
+    // In index order: both `a` records by their key, then `b`. The ids are the
+    // ones the store generated, which is the `autoIncrement` half.
+    assert_eq!(script.eval_value("out").unwrap(), "a1,a3,b2");
+}
+
+/// `arrayBuffer()` hands back the bytes that arrived, not a re-encoding of the
+/// text they decoded to.
+///
+/// `text()` is a UTF-8 decode with replacement characters, so a byte above 0x7f
+/// outside a valid sequence became U+FFFD and re-encoding gave three bytes where
+/// one arrived. A protobuf frame read back that way is not the frame that was
+/// sent, which is how a Connect API reported its own reply as a protocol error.
+#[test]
+fn a_binary_body_survives_arraybuffer() {
+    let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
+
+    // The shape of the bug, without a server: a lossy decode is not reversible,
+    // so the engine has to carry the bytes when the decode lost something.
+    assert_eq!(
+        script
+            .eval_value(
+                "const lossy = new TextDecoder().decode(new Uint8Array([0, 0x80, 0xff])); \
+                 new TextEncoder().encode(lossy).length"
+            )
+            .unwrap(),
+        "7"
+    );
+}
+
+/// A script the page inserts shares the global scope with every other script.
+///
+/// It was run through `eval`, which does not scope alike: a top-level `let` or
+/// `class` inside an indirect `eval` is gone when it returns. `var` survived
+/// because it lands on the global object, which made the gap look like a puzzle
+/// rather than a scoping bug — a chunk loader lost every lexical declaration.
+#[test]
+fn an_inserted_script_shares_the_global_lexical_scope() {
+    let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
+
+    script
+        .eval(
+            "globalThis.out = ''; \
+             function insert(code) { \
+                const el = document.createElement('script'); \
+                el.textContent = code; \
+                document.head.appendChild(el); \
+             } \
+             insert(\"let shared = 'lex'; const kept = 'const'; class Made { who() { return 'cls'; } } \
+                      var old = 'var';\"); \
+             insert(\"globalThis.out = [shared, kept, new Made().who(), old].join(',');\");",
+        )
+        .expect("runs");
+
+    assert_eq!(script.eval_value("out").unwrap(), "lex,const,cls,var");
+}
+
+/// Assigning `location.href` navigates in a browser, and never throws.
+///
+/// This engine does not let a page navigate itself — `assign`, `replace` and
+/// `reload` all say so. But `href` was a getter with no setter, so the
+/// assignment threw and took the caller with it: a React timer callback died
+/// mid-render over a redirect the page was only attempting.
+#[test]
+fn assigning_location_href_is_refused_without_throwing() {
+    let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
+
+    assert_eq!(
+        script
+            .eval_value("'use strict'; location.href = 'https://example.com/'; 'survived'")
+            .unwrap(),
+        "survived"
+    );
+    assert!(
+        script.unsupported().iter().any(|(name, _)| name == "location.href"),
+        "the attempt is reported rather than silently dropped: {:?}",
+        script.unsupported()
+    );
+}
+
+/// An uninitialized-access throw says which binding it is about.
+///
+/// The message was "access of uninitialized binding" and nothing more, which
+/// is the hardest kind of error for an agent to act on: it names neither the
+/// binding nor anything to search a bundle for. Reading grok.com it was the
+/// only clue to a blocked render, and it took instrumenting the engine to find
+/// out the binding was called `s`.
+#[test]
+fn an_uninitialized_binding_names_itself() {
+    let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
+
+    assert_eq!(
+        script
+            .eval_value(
+                "let said = ''; \
+                 try { (function (a = b, b = 1) { return a; })(); } \
+                 catch (e) { said = e.message; } \
+                 said"
+            )
+            .unwrap(),
+        "access of uninitialized binding `b`"
+    );
+}
+
+/// A `switch` discriminant does not declare anything for the case bodies.
+///
+/// The engine collected a `let` from a function expression in the discriminant as
+/// a binding *of the switch*, so a case body reading its own name resolved to the
+/// phantom and compiled to an unconditional throw. Minified bundles shadow
+/// one-letter names constantly, so this read as a name plainly in scope.
+#[test]
+fn a_switch_discriminant_does_not_shadow_the_case_body() {
+    let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
+
+    assert_eq!(
+        script
+            .eval_value(
+                "function outer() { \
+                    let shared = 'correct'; \
+                    switch ((function () { let shared; }, 0)) { \
+                        case 0: return shared; \
+                    } \
+                 } \
+                 outer()"
+            )
+            .unwrap(),
+        "correct"
+    );
+}
+
+/// `getComputedStyle(el).overflow` answers, rather than naming itself a gap.
+///
+/// Shorthands are declined on purpose: getting `border`'s re-serialisation subtly
+/// wrong would tell a caller two different borders match. `overflow` is not that
+/// case — CSSOM defines it as the two longhands — and declining it told every
+/// hunt for a scroll container that the element had no overflow at all.
+#[test]
+fn computed_overflow_comes_from_its_longhands() {
+    let (_page, mut script) = page_and_script(
+        "<html><head><style>#a{overflow:hidden}#b{overflow-x:scroll;overflow-y:auto}</style></head>\
+         <body><div id='a'>a</div><div id='b'>b</div></body></html>",
+    );
+
+    assert_eq!(
+        script
+            .eval_value("getComputedStyle(document.querySelector('#a')).overflow")
+            .unwrap(),
+        "hidden",
+        "equal longhands collapse to one value"
+    );
+    assert_eq!(
+        script
+            .eval_value("getComputedStyle(document.querySelector('#b')).overflow")
+            .unwrap(),
+        "scroll auto",
+        "differing longhands are both reported, x then y"
+    );
+    assert!(
+        !script
+            .unsupported()
+            .iter()
+            .any(|(name, _)| name.contains("overflow")),
+        "and it is no longer counted as a gap: {:?}",
+        script.unsupported()
+    );
+}
+
+/// Three answers this engine has and was reporting as gaps instead.
+///
+/// A gap list is only useful if what is on it is really missing. `display-mode`
+/// has a true answer (a browser, not an installed app), `doNotTrack` has one
+/// (unset reports null), and `assignedSlot` has one because distribution here is
+/// a move. rrweb asked for these hundreds of times, burying the real gaps.
+#[test]
+fn answers_this_engine_has_are_not_reported_as_gaps() {
+    let (_page, mut script) = page_and_script(
+        "<html><body><div id='host'><span id='light'>x</span></div>\
+         <div id='plain'>p</div></body></html>",
+    );
+
+    assert_eq!(
+        script
+            .eval_value("matchMedia('(display-mode: browser)').matches")
+            .unwrap(),
+        "true"
+    );
+    assert_eq!(
+        script
+            .eval_value("matchMedia('(display-mode: standalone)').matches")
+            .unwrap(),
+        "false"
+    );
+    assert_eq!(script.eval_value("String(navigator.doNotTrack)").unwrap(), "null");
+    assert_eq!(
+        script
+            .eval_value("String(document.querySelector('#plain').assignedSlot)")
+            .unwrap(),
+        "null"
+    );
+    assert_eq!(
+        script
+            .eval_value(
+                "const host = document.querySelector('#host'); \
+                 host.attachShadow({ mode: 'open' }).innerHTML = '<slot></slot>'; \
+                 document.querySelector('#light').assignedSlot.tagName"
+            )
+            .unwrap(),
+        "SLOT"
+    );
+    assert!(script.unsupported().is_empty(), "{:?}", script.unsupported());
+}
+
+/// A computed style carries the whole `CSSStyleDeclaration` interface.
+///
+/// The proxy answers any name it does not recognise with a property value, so
+/// a backing object holding only `getPropertyValue` turned every other member
+/// into `""`. Reading one gave a string where a function belonged, and calling
+/// it threw "not a callable function" on an empty string.
+#[test]
+fn a_computed_style_is_a_whole_declaration() {
+    let (_page, mut script) = page_and_script(
+        "<html><head><style>#a{color:red}</style></head><body><div id='a'>a</div></body></html>",
+    );
+
+    assert_eq!(
+        script
+            .eval_value(
+                "(() => { const cs = getComputedStyle(document.querySelector('#a')); \
+                   return [typeof cs.getPropertyValue, typeof cs.getPropertyPriority, \
+                     typeof cs.item, typeof cs.setProperty, typeof cs.length].join(','); })()"
+            )
+            .unwrap(),
+        "function,function,function,function,number"
+    );
+    // A resolved value is never `!important`, and the declaration is read-only.
+    assert_eq!(
+        script
+            .eval_value(
+                "(() => { const cs = getComputedStyle(document.querySelector('#a')); \
+                   return cs.getPropertyPriority('color') + '|' + \
+                     (() => { try { cs.setProperty('color', 'blue'); return 'set'; } \
+                              catch (e) { return e.name; } })(); })()"
+            )
+            .unwrap(),
+        "|NoModificationAllowedError"
+    );
+    assert_eq!(
+        script
+            .eval_value(
+                "getComputedStyle(document.querySelector('#a')) instanceof CSSStyleDeclaration"
+            )
+            .unwrap(),
+        "true"
+    );
+}
+
+/// A name that is not a CSS property is absent from a style, not empty.
+///
+/// Both style proxies answered *any* unknown name with a property value, so
+/// `el.style.whatever` came back as `""` while the `has` trap said it was not
+/// there. Calling one was then a call on a string: "not a callable function".
+#[test]
+fn a_style_name_that_is_not_a_property_is_undefined() {
+    let (_page, mut script) = page_and_script("<html><body><div id='a'>a</div></body></html>");
+
+    assert_eq!(
+        script
+            .eval_value(
+                "(() => { const el = document.querySelector('#a'); \
+                   return [typeof el.style.notACssProp, \
+                     typeof getComputedStyle(el).notACssProp, \
+                     'notACssProp' in el.style].join(','); })()"
+            )
+            .unwrap(),
+        "undefined,undefined,false",
+        "`get` and `has` have to agree"
+    );
+    // And a real property still reads.
+    assert_eq!(
+        script
+            .eval_value(
+                "(() => { const el = document.querySelector('#a'); \
+                   el.style.color = 'red'; \
+                   return el.style.color + ',' + ('color' in el.style); })()"
+            )
+            .unwrap(),
+        "red,true"
+    );
+}
+
+/// A declaration reports its `!important` priorities.
+///
+/// `getPropertyPriority` was missing entirely, so calling it was a call on
+/// nothing. Anything that walks a declaration calls it — copying a style
+/// without it silently drops every priority — and it is where grok.com's
+/// session recorder died mid-render.
+#[test]
+fn a_declaration_reports_its_priorities() {
+    let (_page, mut script) = page_and_script(
+        "<html><body><div id='a' style='color: red !important; margin: 2px'>a</div></body></html>",
+    );
+
+    assert_eq!(
+        script
+            .eval_value(
+                "(() => { const s = document.querySelector('#a').style; \
+                   return [typeof s.getPropertyPriority, \
+                     s.getPropertyPriority('color'), \
+                     s.getPropertyPriority('margin'), \
+                     s.getPropertyValue('color')].join('|'); })()"
+            )
+            .unwrap(),
+        "function|important||red",
+        "the priority is reported, and is not part of the value"
+    );
+    assert_eq!(
+        script
+            .eval_value(
+                "(() => { const s = document.querySelector('#a').style; \
+                   s.setProperty('padding', '3px', 'important'); \
+                   return s.getPropertyPriority('padding') + '/' + s.getPropertyValue('padding'); \
+                 })()"
+            )
+            .unwrap(),
+        "important/3px"
+    );
+}
+
+/// `document` and an `AbortSignal` can be dispatched to, not only listened on.
+///
+/// Both carried `addEventListener` and neither carried `dispatchEvent`, which
+/// makes them half an EventTarget: registering a handler worked, and the call
+/// that would reach it was a call on nothing.
+#[test]
+fn document_and_abort_signal_can_be_dispatched_to() {
+    let (_page, mut script) = page_and_script("<html><body><p>x</p></body></html>");
+
+    assert_eq!(
+        script
+            .eval_value(
+                "(() => { let hits = 0; \
+                   document.addEventListener('mine', () => { hits += 1; }); \
+                   const ok = document.dispatchEvent(new Event('mine')); \
+                   return hits + '/' + ok; })()"
+            )
+            .unwrap(),
+        "1/true"
+    );
+    assert_eq!(
+        script
+            .eval_value(
+                "(() => { const c = new AbortController(); let hits = 0; \
+                   c.signal.addEventListener('abort', () => { hits += 1; }); \
+                   c.signal.dispatchEvent(new Event('abort')); \
+                   return String(hits); })()"
+            )
+            .unwrap(),
+        "1"
     );
 }
