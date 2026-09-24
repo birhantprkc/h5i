@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>h5i: The Red-Teaming Browser for AI Agents</title>
-  <meta name="description" content="h5i is an open-source red-teaming browser for AI agents. Test web apps with direct HTTP control, configurable sandboxing, and auditable sessions. Built in Rust.">
+  <title>h5i: Professional Red-Teaming for Every Team</title>
+  <meta name="description" content="No security expertise needed. h5i gives your AI agent browser automation and direct HTTP control to red-team your web app, inside sandbox limits you set.">
   <meta name="author" content="h5i-dev">
   <meta name="theme-color" content="#D21C1C">
   <meta name="color-scheme" content="dark">
@@ -20,8 +20,8 @@
   <!-- Open Graph -->
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="h5i">
-  <meta property="og:title" content="h5i: The Red-Teaming Browser for AI Agents">
-  <meta property="og:description" content="Give AI agents page automation and direct HTTP control for authorized web red teaming. Configure sandbox and network limits, then review the session. Pure Rust, no Chromium or V8.">
+  <meta property="og:title" content="h5i: Professional Red-Teaming for Every Team">
+  <meta property="og:description" content="You don't need to be a security expert to red-team your web app. h5i gives your AI agent page automation and direct HTTP control to explore pages, inspect and replay requests, and investigate attack paths. Set sandbox and network limits, then review what it did.">
   <meta property="og:url" content="https://h5i.dev/">
   <meta property="og:image" content="https://h5i.dev/_static/sandboxed-browser-ui.png">
   <meta property="og:image:alt" content="An h5i browser session: the page an agent is reading, beside the request log the engine wrote before any bytes moved">
@@ -29,8 +29,8 @@
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="h5i: The Red-Teaming Browser for AI Agents">
-  <meta name="twitter:description" content="Give AI agents page automation and direct HTTP control for authorized web red teaming. Configure sandbox and network limits, then review the session. Pure Rust, no Chromium or V8.">
+  <meta name="twitter:title" content="h5i: Professional Red-Teaming for Every Team">
+  <meta name="twitter:description" content="You don't need to be a security expert to red-team your web app. h5i gives your AI agent page automation and direct HTTP control to explore pages, inspect and replay requests, and investigate attack paths. Set sandbox and network limits, then review what it did.">
   <meta name="twitter:image" content="https://h5i.dev/_static/sandboxed-browser-ui.png">
   <meta name="twitter:image:alt" content="An h5i browser session: the page an agent is reading, beside the request log the engine wrote before any bytes moved">
 
@@ -60,7 +60,7 @@
       "name": "h5i",
       "alternateName": "high-five",
       "url": "https://h5i.dev/",
-      "description": "The red-teaming browser for AI agents. h5i combines page automation and direct HTTP control for authorized web application testing, with configurable sandboxing, network policies, and auditable sessions.",
+      "description": "Professional red-teaming for every team. h5i gives your AI agent page automation and direct HTTP control for authorized web application testing, with configurable sandboxing, network policies, and auditable sessions.",
       "publisher": {
         "@id": "https://h5i.dev/#org"
       },
@@ -72,13 +72,13 @@
       "name": "h5i",
       "alternateName": "high-five",
       "applicationCategory": "DeveloperApplication",
-      "applicationSubCategory": "Red-teaming browser for AI agents",
+      "applicationSubCategory": "Red-teaming tools for AI agents",
       "operatingSystem": "Linux, macOS, Windows (WSL2)",
-      "description": "h5i is an open-source red-teaming browser for AI agents, written in Rust without Chromium or V8. It combines page automation with HTTP inspection, editing, replay, and response comparison through the websec plugin. Configurable sandboxing and network policies restrict access during authorized web application testing, while session records support review.",
+      "description": "h5i brings professional red-teaming tools to teams without a security specialist. Your AI agent uses them to test your web app from an attacker's perspective. Written in Rust without Chromium or V8, h5i combines page automation with HTTP inspection, editing, replay, and response comparison through the websec plugin. Configurable sandboxing and network policies restrict access during authorized web application testing, while session records support review.",
       "featureList": [
         "Page automation and compact snapshots with @ref handles for AI agents",
         "HTTP capture, inspection, editing, replay, and response comparison through the websec plugin",
-        "Response assertions and multi-step flows for repeatable security tests",
+        "Multi-step test flows that replay findings in CI with your own oracle",
         "Configurable sandboxing for the browser or the entire agent workflow",
         "Network policies that restrict destinations and record denied requests",
         "Auditable browser actions and network requests",
@@ -86,7 +86,7 @@
         "Pure Rust, no Chromium or V8",
         "About 3x faster reads with about 86% less peak memory than headless Chromium on simple websites in our benchmarks"
       ],
-      "keywords": "AI agents, red teaming, web application security testing, headless browser, HTTP replay, sandboxing, Rust",
+      "keywords": "AI agents, red teaming, AI red teaming for developers, security testing without a security team, web application security testing, headless browser, HTTP replay, sandboxing, Rust",
       "url": "https://h5i.dev/",
       "downloadUrl": "https://github.com/h5i-dev/h5i",
       "installUrl": "https://h5i.dev/#quickstart",
@@ -113,8 +113,8 @@
       "@type": "WebPage",
       "@id": "https://h5i.dev/#webpage",
       "url": "https://h5i.dev/",
-      "name": "h5i: The Red-Teaming Browser for AI Agents",
-      "description": "h5i is an open-source red-teaming browser for AI agents. Test web apps with direct HTTP control, configurable sandboxing, and auditable sessions. Built in Rust.",
+      "name": "h5i: Professional Red-Teaming for Every Team",
+      "description": "No security expertise needed. h5i gives your AI agent browser automation and direct HTTP control to red-team your web app, inside sandbox limits you set.",
       "isPartOf": {
         "@id": "https://h5i.dev/#website"
       },
@@ -152,7 +152,23 @@
           "name": "What is h5i?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "h5i is an open-source red-teaming browser built for AI agents. It combines page automation with direct HTTP control through the websec plugin, configurable sandboxing, and auditable sessions. It runs locally and is written in Rust without Chromium or V8."
+            "text": "h5i is an open-source toolkit that lets your AI agent red-team your web application. It gives the agent page automation and direct HTTP control through the websec plugin, runs it inside sandbox and network limits you configure, and records every action for review. It runs locally and is written in Rust without Chromium or V8."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Do I need to be a security expert to use h5i?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. You tell your agent what to check in plain language, for example whether one user can read another user's orders. The agent explores the app in the browser, captures the requests behind each action, then edits and replays them to test the idea. Every request and response is recorded, so you, or a security reviewer later, can check the evidence behind a finding. Only test applications you own or are authorized to test."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is h5i an automated vulnerability scanner?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. h5i does not run a fixed list of checks against a URL and hand back a report. It gives your agent the tools a professional tester uses, and the agent decides what to try. Once a finding is confirmed, h5i test can replay it as a flow in CI, so a fixed issue stays fixed."
           }
         },
         {
@@ -161,6 +177,14 @@
           "acceptedAnswer": {
             "@type": "Answer",
             "text": "Use Playwright or Puppeteer when maximum website compatibility is your priority. Use h5i when your AI agent needs page automation and direct HTTP testing through one interface, with configurable sandboxing, network policies, and a reviewable session record."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why use h5i instead of Burp Suite?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Use Burp Suite when an experienced tester wants the deepest workbench: an intercepting proxy, Scanner, Intruder, extensions, and Burp's own agent. Use h5i when your own AI agent should run the test end to end. One session drives the browser and records its traffic, and the agent edits, replays, and compares requests through a CLI built for it, without a security specialist driving each step."
           }
         },
         {
@@ -248,11 +272,9 @@
 <section id="hero" tabindex="-1">
   <div class="hero-inner">
     <div class="hero-badge">Web red teaming &middot; Direct HTTP control &middot; Sandboxed execution</div>
-    <h1 class="hero-title"><em>The Red-Teaming Browser</em><br>for AI Agents</h1>
+    <h1 class="hero-title"><em>Professional Red-Teaming</em></br> for Every Team</h1>
     <p class="hero-sub">
-    Give AI agents <strong>page automation</strong> and <strong>direct HTTP control</strong> to test web applications
-      from an attacker's perspective. h5i lets them inspect, edit, replay, and compare traffic
-      through one interface. Set sandbox and network limits, then review what they did.
+    You don't need to be a security expert to perform red-teaming. h5i gives your AI agent <strong>page automation</strong> and <strong>direct HTTP control</strong> to test web applications from an attacker's perspective.
     </p>
     <div class="hero-install" id="quickstart">
       <code id="install-cmd">curl -fsSL https://h5i.dev/install.sh | sh -s -- --websec</code>
@@ -289,30 +311,25 @@
   <div class="container">
     <div class="section-head">
       <span class="section-tag">The problem</span>
-      <h2 class="section-title">Automating red teaming safely is hard.</h2>
-      <p class="section-sub">Many browsers and red-teaming tools were built for people, not AI agents.
-        Automating them adds complexity, while controlling and auditing the agent's actions remains difficult.</p>
+      <h2 class="section-title">Red Teaming is Expensive, Difficult, and Dangerous.</h2>
+      <p class="section-sub">Hiring security specialists can be expensive, and existing tools make it difficult to give AI agents the capabilities and boundaries they need.</p>
     </div>
     <div class="feat-grid feat-grid-four">
       <div class="feat-card">
-        <div class="feat-name">Existing tools for human are too slow</div>
-        <div class="feat-desc">Complex GUIs require agents to interpret screens and navigate menus.
-          Full browser engines also add startup time and memory overhead to automated testing.</div>
+        <div class="feat-name">Security expertise is hard to find</div>
+        <div class="feat-desc">Effective red teaming requires us to understand an application, form attack hypothesis, and verify findings. Many teams do not have someone who can do that regularly.</div>
       </div>
       <div class="feat-card">
-        <div class="feat-name">Manual red-teaming workflows are hard to automate</div>
-        <div class="feat-desc">Tools designed for human operators often require manual setup and switching
-          between browser, proxy, and request editor. Connecting these steps for an AI agent takes extra work.</div>
+        <div class="feat-name">Outside assessments are expensive</div>
+        <div class="feat-desc">A professional assesment can be valuable, but paying for one every time an application is out of reach for many teams.</div>
       </div>
       <div class="feat-card">
-        <div class="feat-name">AI agents can attack the wrong systems</div>
-        <div class="feat-desc">An agent can make a mistake or follow a prompt injection and attack an unrelated
-          application. Telling it to stay within scope does not enforce that restriction.</div>
+        <div class="feat-name">Existing tools were build for people</div>
+        <div class="feat-desc">Complex GUIs require agents to interpret screens and navigate menus. Agents need a direct way to navigate an application and work with its HTTP traffic.</div>
       </div>
       <div class="feat-card">
-        <div class="feat-name">AI actions are hard to audit</div>
-        <div class="feat-desc">An agent's summary may omit actions, and logs may be scattered across tools.
-          Reconstructing which systems it reached and what it actually did is difficult.</div>
+        <div class="feat-name">AI agents may run out of control</div>
+        <div class="feat-desc">An agent can make mistakes or follow malicious instructions in a page. Testing needs enforceable sandbox and a record of what the agent actually did.</div>
       </div>
     </div>
   </div>
@@ -325,8 +342,8 @@
   <div class="container">
     <div class="section-head">
       <span class="section-tag">What h5i gives you</span>
-      <h2 class="section-title">Auto-browsing. Control web traffic. Sandbox workflows.</h2>
-      <p class="section-sub">h5i combines automated browsing with its own HTTP client. It gives AI agents direct access
+      <h2 class="section-title">Automate Red Teaming with Your AI Agent.</h2>
+      <p class="section-sub">h5i combines automated browsing with its own HTTP client. It gives your AI agents direct access
         to captured requests and responses for web application penetration testing, CTFs, and red teaming.
         Use it only on applications you own or are authorized to test.</p>
       <p class="section-sub"><a href="https://github.com/h5i-dev/h5i-benchmark" style="color:var(--red-text)">Explore the agent benchmark results &#8594;</a></p>
@@ -359,15 +376,14 @@
 <span class="t-prompt">$</span> <span class="t-cmd">h5i browser open https://docs.rs/ --in custom-sandbox</span>                         <span class="t-cmt"># open the session inside that box</span></pre></div></div>
     <div class="feat-grid">
       <div class="feat-card">
-        <div class="feat-name">Automated browsing</div>
-        <div class="feat-desc">Read pages, click, type, and extract data through compact snapshots with <code>@ref</code> handles.
+        <div class="feat-name">Explore your app automatically</div>
+        <div class="feat-desc">Your agent can read pages, click, type, and extract data through compact snapshots.
           Pure Rust, no Chromium or V8: ~3&times; faster reads with ~86% less peak memory than headless Chromium
           <a href="https://github.com/h5i-dev/h5i/blob/main/docs/design/design-browser.md">in our simple-site benchmarks</a>.</div>
       </div>
       <div class="feat-card">
-        <div class="feat-name">Direct HTTP capture and editing</div>
-        <div class="feat-desc">Capture requests and responses, inspect headers and bodies, edit and replay requests,
-          and compare results through the websec plugin. No separate MITM proxy or CA setup.</div>
+        <div class="feat-name">Test HTTP requests directly</div>
+        <div class="feat-desc">Your agent can capture traffic, inspect and edit requests, replay them, and compare responses. Browser activity and HTTP testing share one interface, with no separate proxy or CA setup..</div>
       </div>
       <div class="feat-card">
         <div class="feat-name">Sandboxed workflow</div>
@@ -647,11 +663,23 @@
     <div class="faq-list">
       <details class="faq-item" open>
         <summary>What is h5i?</summary>
-        <div class="faq-answer">h5i is an open-source red-teaming browser built for AI agents. It combines page automation with direct HTTP control through the websec plugin, configurable sandboxing, and auditable sessions. It runs locally and is written in Rust without Chromium or V8.</div>
+        <div class="faq-answer">h5i is an open-source toolkit that lets your AI agent red-team your web application. It gives the agent page automation and direct HTTP control through the websec plugin, runs it inside sandbox and network limits you configure, and records every action for review. It runs locally and is written in Rust without Chromium or V8.</div>
+      </details>
+      <details class="faq-item">
+        <summary>Do I need to be a security expert to use h5i?</summary>
+        <div class="faq-answer">No. You tell your agent what to check in plain language, for example whether one user can read another user's orders. The agent explores the app in the browser, captures the requests behind each action, then edits and replays them to test the idea. Every request and response is recorded, so you, or a security reviewer later, can check the evidence behind a finding. Only test applications you own or are authorized to test.</div>
+      </details>
+      <details class="faq-item">
+        <summary>Is h5i an automated vulnerability scanner?</summary>
+        <div class="faq-answer">No. h5i does not run a fixed list of checks against a URL and hand back a report. It gives your agent the tools a professional tester uses, and the agent decides what to try. Once a finding is confirmed, <code>h5i test</code> can replay it as a flow in CI, so a fixed issue stays fixed.</div>
       </details>
       <details class="faq-item">
         <summary>Why use h5i instead of Playwright or Puppeteer?</summary>
         <div class="faq-answer">Use Playwright or Puppeteer when maximum website compatibility is your priority. Use h5i when your AI agent needs page automation and direct HTTP testing through one interface, with configurable sandboxing, network policies, and a reviewable session record.</div>
+      </details>
+      <details class="faq-item">
+        <summary>Why use h5i instead of Burp Suite?</summary>
+        <div class="faq-answer">Use Burp Suite when an experienced tester wants the deepest workbench: an intercepting proxy, Scanner, Intruder, extensions, and Burp's own agent. Use h5i when your own AI agent should run the test end to end. One session drives the browser and records its traffic, and the agent edits, replays, and compares requests through a CLI built for it, without a security specialist driving each step. See the <a href="/blog/burp-suite-vs-h5i-for-ai-agents/">full comparison</a>.</div>
       </details>
       <details class="faq-item">
         <summary>Does h5i work on every website?</summary>
