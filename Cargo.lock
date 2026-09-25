@@ -2209,6 +2209,7 @@ name = "h5i-test"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "h5i-core",
  "h5i-wire",
@@ -2236,6 +2237,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "url",
 ]
@@ -2244,9 +2246,13 @@ dependencies = [
 name = "h5i-wire"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
+ "md-5",
+ "regex",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "tempfile",
  "url",
@@ -3457,6 +3463,16 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
 
 [[package]]
 name = "memchr"

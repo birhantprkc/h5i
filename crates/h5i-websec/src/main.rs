@@ -19,6 +19,7 @@
 
 mod experiment;
 mod finding;
+mod nuclei;
 mod read;
 
 use std::ffi::OsString;
@@ -251,12 +252,15 @@ enum Verb {
 
     /// Run a multi-step flow with bindings between the steps.
     ///
-    /// Steps run in order, bind response values, and stop on failure:
+    /// Steps run in order, bind response values, and stop on failure. A step may
+    /// carry an `expect`: a data-only verdict over its answer. When it does not
+    /// hold the run exits 1 (did not match), distinct from 2 (could not look):
     ///
     /// ```json
     /// {"steps": [
     ///   {"resend": 3, "extract": {"csrf": "regex:value=\"([^\"]+)\""}},
-    ///   {"resend": 5, "set": ["header.X-CSRF-Token=${csrf}", "json.role=admin"]}
+    ///   {"resend": 5, "set": ["header.X-CSRF-Token=${csrf}", "json.role=admin"],
+    ///    "expect": {"all": [{"status": 200}, {"body": "regex:role.*admin"}]}}
     /// ]}
     /// ```
     Sequence {
@@ -269,6 +273,24 @@ enum Verb {
         /// Continue after failed steps.
         #[arg(long)]
         keep_going: bool,
+    },
+
+    /// Convert a Nuclei template into an h5i test, printed to stdout.
+    ///
+    /// The template's request becomes a request template, its matchers become an
+    /// `expect` verdict, and its regex extractors become bindings. It never emits
+    /// an oracle: an imported recipe is data, not code (design-flow-and-verdict.md
+    /// F7, F9). A construct with no data-only equivalent is refused rather than
+    /// lowered into a script.
+    ///
+    /// ```text
+    /// h5i websec import-nuclei cve-2021-1234.yaml > .h5i-tests/tests/cve.yaml
+    /// ```
+    #[command(name = "import-nuclei")]
+    ImportNuclei {
+        /// The Nuclei template file (YAML).
+        #[arg(value_name = "FILE")]
+        file: String,
     },
 }
 
@@ -453,6 +475,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Verb::Finding { what } => {
             return findings(&root, session.as_deref(), what, json_out);
         }
+        Verb::ImportNuclei { file } => {
+            return nuclei::import(std::path::Path::new(file));
+        }
         _ => {}
     }
 
@@ -493,7 +518,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         | Verb::Match { .. }
         | Verb::Sitemap
         | Verb::Experiment { .. }
-        | Verb::Finding { .. } => {
+        | Verb::Finding { .. }
+        | Verb::ImportNuclei { .. } => {
             unreachable!("the verbs this process handles return before this")
         }
         Verb::Replay {
