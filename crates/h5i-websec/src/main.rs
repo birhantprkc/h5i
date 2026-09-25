@@ -109,9 +109,11 @@ enum Verb {
         /// `req_42`, or just `42`.
         #[arg(value_name = "ID")]
         id: String,
-        /// Set a request field; repeatable and ordered. JSON values are typed,
-        /// nested by dots, and arrays use numeric segments. Preserve numeric
-        /// strings with shell-safe quotes: `--set 'json.jsonrpc="2.0"'`.
+        /// Set a request field; repeatable and ordered. Common TARGETs:
+        /// `method=POST`, `path=/other/url`, `query.KEY=v`, `header.NAME=v`,
+        /// `cookie.NAME=v`, `json.PATH=v`. JSON values are typed, nested by dots,
+        /// and arrays use numeric segments. Preserve numeric strings with
+        /// shell-safe quotes: `--set 'json.jsonrpc="2.0"'`.
         #[arg(long = "set", value_name = "TARGET=VALUE")]
         set: Vec<String>,
         /// `multipart.userfile=./payload.jpg`: the value is the file's bytes.
@@ -124,7 +126,8 @@ enum Verb {
         /// Remove a target.
         #[arg(long = "unset", value_name = "TARGET")]
         unset: Vec<String>,
-        /// Add targets that are not there.
+        /// Add a query/cookie/form/json target the request lacks. Off by default
+        /// so a typo is caught, not sent (headers always upsert).
         #[arg(long)]
         create: bool,
         /// Send it from another session, with that session's credentials.
@@ -168,6 +171,16 @@ enum Verb {
         /// input. Use it when `--set` cannot express the body.
         #[arg(long = "raw-request", value_name = "PATH")]
         raw_request: Option<String>,
+        /// After sending, print the decoded, untruncated response body to stdout
+        /// (the `curl` view). With `--set-each`/`--repeat`, each body under a
+        /// `--- res_<n> ---` line.
+        #[arg(long)]
+        body: bool,
+        /// Like `--body`, but print the whole response — status line, headers,
+        /// then body (as `show --raw` does), the `curl -i` view. Use it when the
+        /// answer is in a header. Wins over `--body` if both are given.
+        #[arg(long)]
+        raw: bool,
     },
 
     /// How two of this session's responses differ.
@@ -482,6 +495,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     let mut argv: Vec<String> = vec!["browser".to_string()];
+    // `replay --body`/`--raw`: print the stored response(s) instead of the JSON
+    // envelope (body only, or whole response for `--raw`).
+    let mut replay_body = false;
+    let mut replay_raw = false;
     fn push(argv: &mut Vec<String>, args: &[&str]) {
         argv.extend(args.iter().map(|arg| (*arg).to_string()));
     }
@@ -538,7 +555,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             raw_request,
             raw_headers,
             set_each,
+            body,
+            raw,
         } => {
+            replay_body = body || raw;
+            replay_raw = raw;
             let seq = sequence_of(&id)?;
             push(&mut argv, &["resend"]);
             argv.push(seq);
@@ -620,10 +641,55 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         argv.push("--json".into());
     }
 
-    let status = Command::new(h5i())
-        .args(&argv)
+    // Snapshot the store so we know which messages the send adds (N for
+    // `--set-each`/`--repeat`), then swallow its stdout and print them ourselves.
+    let pre_seq = if replay_body {
+        read::latest_seq(&root, session.as_deref()).unwrap_or(None)
+    } else {
+        None
+    };
+    let mut cmd = Command::new(h5i());
+    cmd.args(&argv);
+    if replay_body {
+        cmd.stdout(std::process::Stdio::null());
+    }
+    let status = cmd
         .status()
         .map_err(|e| anyhow::anyhow!("could not run h5i: {e}"))?;
+    if replay_body {
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(2));
+        }
+        let seqs = read::seqs_after(&root, session.as_deref(), pre_seq).unwrap_or_default();
+        if seqs.is_empty() {
+            eprintln!(
+                "  note     : nothing to print — the session kept no messages \
+                 (open it with `--capture`)"
+            );
+        }
+        // More than one send (a sweep): label each so stdout can be split.
+        let multi = seqs.len() > 1;
+        let body_to = if replay_raw {
+            None
+        } else {
+            Some(std::path::Path::new("-"))
+        };
+        for seq in seqs {
+            if multi {
+                println!("--- res_{seq} ---");
+            }
+            read::show(
+                &root,
+                session.as_deref(),
+                seq,
+                read::Part::Response,
+                replay_raw,
+                body_to,
+                false,
+            )?;
+        }
+        std::process::exit(status.code().unwrap_or(0));
+    }
     // The underlying verb's code, unchanged. `match` exits 1 for "did not
     // match" and 2 for "could not look", and flattening those here would break
     // every script built on them.

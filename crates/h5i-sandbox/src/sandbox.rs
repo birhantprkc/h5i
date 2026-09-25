@@ -333,6 +333,22 @@ pub fn is_agent_profile(name: &str) -> bool {
     matches!(name, "agent" | "agent-claude" | "agent-codex" | "browser")
 }
 
+/// Can an agent CLI (claude/codex) run in this box? True for a built-in agent
+/// profile, or any custom one that grants the agent's HOME state
+/// (`~/.claude*`/`~/.codex`) — the shape a hand-rolled red-teaming profile uses.
+pub fn profile_runs_agent(p: &Profile) -> bool {
+    is_agent_profile(&p.name) || grants_agent_home(p)
+}
+
+fn grants_agent_home(p: &Profile) -> bool {
+    p.fs_write.iter().any(|w| {
+        matches!(
+            w.trim_end_matches('/').rsplit('/').next().unwrap_or(w),
+            ".claude" | ".claude.json" | ".codex"
+        )
+    })
+}
+
 /// Load profile `name` from `<repo>/.h5i/env.toml`, falling back to the
 /// built-in when the file (or the profile entry) is absent and `name` is a
 /// built-in one (`default`, `agent`).
@@ -2254,14 +2270,14 @@ fn apply_env_allowlist(
 /// `CAP_NET_ADMIN` to survive `execve` for `nft`), and Claude's guard refuses
 /// the flag on a bare `getuid()==0`. `IS_SANDBOX=1` skips only that root check
 /// and grants *no* new capability: the box already pins the agent to our real
-/// unprivileged host uid. Scoped to agent profiles, and a caller-supplied or
-/// brokered `IS_SANDBOX` wins; we only set the default.
+/// unprivileged host uid. Scoped to agent-capable profiles; a caller-supplied or
+/// brokered `IS_SANDBOX` wins.
 fn augment_injected_env(
     policy: &ResolvedPolicy,
     injected_env: &[(String, String)],
 ) -> Vec<(String, String)> {
     let mut env = injected_env.to_vec();
-    if is_agent_profile(&policy.profile.name)
+    if profile_runs_agent(&policy.profile)
         && !env.iter().any(|(k, _)| k == "IS_SANDBOX")
         && !policy.profile.env_pass.iter().any(|k| k == "IS_SANDBOX")
     {
@@ -4075,6 +4091,22 @@ resources = { mem = "2G", fsize = "100M", cpu = "5s" }
         assert!(
             !env.iter().any(|(k, _)| k == "IS_SANDBOX"),
             "default profile must not inject IS_SANDBOX"
+        );
+    }
+
+    #[test]
+    fn custom_profile_granting_claude_home_injects_is_sandbox() {
+        // A custom profile that grants ~/.claude runs an agent, so it gets
+        // IS_SANDBOX=1 even though its name is not `agent`.
+        let mut p = Profile::builtin("default", IsolationClaim::Supervised);
+        p.name = "redteam".to_string();
+        p.fs_write.push("~/.claude".to_string());
+        assert!(profile_runs_agent(&p));
+        let policy = ResolvedPolicy::new(p.isolation, p);
+        let env = augment_injected_env(&policy, &[]);
+        assert!(
+            env.iter().any(|(k, v)| k == "IS_SANDBOX" && v == "1"),
+            "custom profile granting ~/.claude must inject IS_SANDBOX"
         );
     }
 
