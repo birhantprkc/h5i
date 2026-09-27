@@ -28,7 +28,7 @@ pub const MAX_FINDINGS_BYTES: u64 = 4 * 1024 * 1024;
 /// How much of an action log the console reads on one poll.
 pub const MAX_ACTIONS_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The most endpoints one detail view returns.
+/// The most endpoints one detail view returns. `h5i recon endpoints` has them all.
 pub const MAX_ENDPOINTS_SHOWN: usize = 500;
 
 /// Anything newer than this counts as "now" for the working/idle line.
@@ -275,6 +275,13 @@ pub fn ledger_endpoints(session_dir: &Path) -> Vec<h5i_wire::ledger::Endpoint> {
     let head = &bytes[..bytes.len().min(MAX_LEDGER_BYTES as usize)];
     let text = String::from_utf8_lossy(head);
     let mut endpoints = h5i_wire::ledger::fold(text.lines()).endpoints;
+    // Past the cap, keep what answered before the 404s, newest first in each.
+    endpoints.sort_by(|a, b| {
+        (a.status == Some(404))
+            .cmp(&(b.status == Some(404)))
+            .then_with(|| b.last_seen.cmp(&a.last_seen))
+            .then_with(|| b.line.cmp(&a.line))
+    });
     endpoints.truncate(MAX_ENDPOINTS_SHOWN);
     endpoints
 }
@@ -554,8 +561,10 @@ pub struct SiteOrigin {
     pub endpoints: Vec<SiteEndpoint>,
 }
 
-/// The most paths one origin keeps on the map. Past this the fold counts and
-/// says so through `hits` rather than growing the screen without bound.
+/// The most paths the map keeps on screen. Past this the fold drops paths that
+/// only ever 404'd before ones that answered, so the budget is not spent on a
+/// sweep's misses. Origin counts still cover every fetch. `h5i websec sitemap`
+/// keeps them all.
 pub const MAX_SITEMAP_PATHS: usize = 2000;
 
 /// The request log folded into origins and paths: what this session reached,
@@ -563,7 +572,6 @@ pub const MAX_SITEMAP_PATHS: usize = 2000;
 /// the same receipts, so the two never disagree about where a session went.
 pub fn sitemap(records: &[serde_json::Value]) -> Vec<SiteOrigin> {
     let mut origins: Vec<SiteOrigin> = Vec::new();
-    let mut paths = 0usize;
     for record in records {
         let Some(url) = record.get("url").and_then(|v| v.as_str()) else {
             continue;
@@ -596,17 +604,6 @@ pub fn sitemap(records: &[serde_json::Value]) -> Vec<SiteOrigin> {
         let e = match origin.endpoints.iter().position(|e| e.path == path) {
             Some(i) => i,
             None => {
-                if paths >= MAX_SITEMAP_PATHS {
-                    if phase == "request" {
-                        if allowed {
-                            origin.hits += 1;
-                        } else {
-                            origin.refused += 1;
-                        }
-                    }
-                    continue;
-                }
-                paths += 1;
                 origin.endpoints.push(SiteEndpoint {
                     path,
                     ..SiteEndpoint::default()
@@ -649,6 +646,46 @@ pub fn sitemap(records: &[serde_json::Value]) -> Vec<SiteOrigin> {
                 }
             }
             _ => {}
+        }
+    }
+    // The log the fold reads is byte-capped, so the map is bounded already.
+    // Trim it to the screen budget here rather than while folding, so a path
+    // that answered is never dropped in favour of an earlier 404: keep the ones
+    // that answered something other than 404, newest first, then the rest.
+    // Origin totals are summed per request above, so a dropped path still counts.
+    let total: usize = origins.iter().map(|o| o.endpoints.len()).sum();
+    if total > MAX_SITEMAP_PATHS {
+        let missed = |e: &SiteEndpoint| {
+            e.refused == 0 && !e.statuses.is_empty() && e.statuses.iter().all(|s| *s == 404)
+        };
+        let mut rank: Vec<(usize, usize)> = Vec::with_capacity(total);
+        for (oi, o) in origins.iter().enumerate() {
+            for ei in 0..o.endpoints.len() {
+                rank.push((oi, ei));
+            }
+        }
+        rank.sort_by(|&(ao, ae), &(bo, be)| {
+            let a = &origins[ao].endpoints[ae];
+            let b = &origins[bo].endpoints[be];
+            missed(a)
+                .cmp(&missed(b))
+                .then_with(|| b.last_seq.cmp(&a.last_seq))
+        });
+        rank.truncate(MAX_SITEMAP_PATHS);
+        let mut keep: Vec<Vec<bool>> = origins
+            .iter()
+            .map(|o| vec![false; o.endpoints.len()])
+            .collect();
+        for (oi, ei) in rank {
+            keep[oi][ei] = true;
+        }
+        for (oi, o) in origins.iter_mut().enumerate() {
+            let mut i = 0;
+            o.endpoints.retain(|_| {
+                let k = keep[oi][i];
+                i += 1;
+                k
+            });
         }
     }
     // Busiest origins first; within one, paths in the order they were reached.
@@ -876,5 +913,50 @@ mod tests {
         assert_eq!(cdn.hits, 0);
         assert_eq!(cdn.refused, 1);
         assert_eq!(cdn.endpoints[0].refused, 1);
+    }
+
+    #[test]
+    fn the_sitemap_keeps_a_late_answer_over_a_sweep_of_404s() {
+        // A wordlist sweep of 404s, more than the screen budget, then one path
+        // that answered 302 last. The cap must not drop the answer for a miss.
+        let mut records = Vec::new();
+        for i in 0..(MAX_SITEMAP_PATHS + 50) {
+            let url = format!("https://a.test/miss{i}");
+            records.push(json!({"seq":i,"phase":"request","initiator":"replay","method":"GET","url":url,"allowed":true}));
+            records.push(json!({"seq":i,"phase":"response","initiator":"replay","method":"GET","url":url,"allowed":true,"status":404}));
+        }
+        let seq = MAX_SITEMAP_PATHS + 100;
+        records.push(json!({"seq":seq,"phase":"request","initiator":"replay","method":"GET","url":"https://a.test/api.php","allowed":true}));
+        records.push(json!({"seq":seq,"phase":"response","initiator":"replay","method":"GET","url":"https://a.test/api.php","allowed":true,"status":302}));
+
+        let map = sitemap(&records);
+        let a = &map[0];
+        assert_eq!(a.endpoints.len(), MAX_SITEMAP_PATHS, "trimmed to the budget");
+        let api = a.endpoints.iter().find(|e| e.path == "/api.php");
+        assert!(api.is_some(), "the 302 discovered last survives the trim");
+        assert_eq!(api.unwrap().statuses, vec![302]);
+        // Origin totals still count every fetch, dropped paths included.
+        assert_eq!(a.hits, MAX_SITEMAP_PATHS + 51);
+    }
+
+    #[test]
+    fn capped_endpoints_keep_answers_before_404s_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("recon")).unwrap();
+        let line = |path: &str, at: &str, status: u16| {
+            let id = h5i_wire::ledger::endpoint_id("https://a.test", path, "GET", "native");
+            format!(
+                r#"{{"id":"{id}","origin":"https://a.test","path":"{path}","method":"GET","identity":"native","state":"observed","source":{{"from":"receipt","req":"req_0"}},"at":"{at}","req":"req_0","status":{status}}}"#
+            )
+        };
+        let lines = [
+            line("/a", "2026-09-27T00:00:01Z", 200),
+            line("/b", "2026-09-27T00:00:04Z", 404),
+            line("/c", "2026-09-27T00:00:03Z", 302),
+            line("/d", "2026-09-27T00:00:02Z", 404),
+        ];
+        std::fs::write(ledger_path(dir.path()), lines.join("\n")).unwrap();
+        let paths: Vec<String> = ledger_endpoints(dir.path()).into_iter().map(|e| e.path).collect();
+        assert_eq!(paths, ["/c", "/a", "/b", "/d"]);
     }
 }
