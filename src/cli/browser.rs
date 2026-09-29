@@ -98,6 +98,37 @@ pub const DEFAULT_IDENTITY: &str = "native";
 
 #[derive(Subcommand)]
 pub enum BrowserCommands {
+    /// Capture an external Chromium session through an h5i HTTP/S proxy.
+    ///
+    /// The command starts a resident session and prints the exact
+    /// `agent-browser` flags for it. On Linux those flags trust this session's
+    /// CA. On macOS they pass `--ignore-https-errors`, because agent-browser
+    /// cannot install a CA there and Chromium then accepts every certificate
+    /// error for that launch. Chromium remains agent-browser's; h5i owns
+    /// policy, capture, replay and evidence.
+    Proxy {
+        /// The first target, used to seed the origin allowlist.
+        url: String,
+        /// Name this session.
+        #[arg(long, short = 's', value_name = "NAME")]
+        session: Option<String>,
+        /// The engagement whose scope supplies additional grants and denies.
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+        /// Grant another origin. Repeatable.
+        #[arg(long = "allow", value_name = "ORIGIN")]
+        allow: Vec<String>,
+        /// Refuse loopback too.
+        #[arg(long)]
+        no_loopback: bool,
+        /// End the proxy automatically after this many seconds.
+        #[arg(long, value_name = "SECONDS")]
+        expires_in: Option<u64>,
+        /// Print the session record as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Open a URL, making a session if there is not one already.
     ///
     /// With no `--session`, this uses the default session and points the
@@ -1166,20 +1197,6 @@ pub enum BrowserCommands {
         json: bool,
     },
 
-    /// Hand the page to the human at the live view for as long as a login takes.
-    Login {
-        /// Which session, when more than one is open. A name from
-        /// `--session` at open time, or an opaque id. Defaults to
-        /// $H5I_BROWSER_SESSION, then to the session `open` last made.
-        #[arg(long, short = 's', value_name = "NAME")]
-        session: Option<String>,
-        /// End login mode and make the page readable again.
-        #[arg(long)]
-        off: bool,
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Take control as a human. The agent's automation pauses at its next verb.
     Take {
         /// Which session, when more than one is open.
@@ -1246,6 +1263,24 @@ pub fn run(action: BrowserCommands) -> anyhow::Result<()> {
     let _ = bs::expire_due(&root);
 
     match action {
+        BrowserCommands::Proxy {
+            url,
+            session,
+            project,
+            allow,
+            no_loopback,
+            expires_in,
+            json,
+        } => start_proxy(
+            &root,
+            url,
+            session,
+            project,
+            allow,
+            no_loopback,
+            expires_in,
+            json,
+        ),
         BrowserCommands::Open {
             url,
             session,
@@ -1887,15 +1922,6 @@ pub fn run(action: BrowserCommands) -> anyhow::Result<()> {
         BrowserCommands::Env { session, json } => {
             verb(&root, session.as_deref(), vec!["env".into()], false, json)
         }
-        BrowserCommands::Login { session, off, json } => {
-            let mut argv = vec!["login".to_string()];
-            argv.push(if off { "--off".into() } else { "--on".into() });
-            // Not mutating in the lock's sense: `login` is how a human takes the
-            // keyboard, so refusing it while a human holds control would refuse
-            // the very thing they are here to do.
-            verb(&root, session.as_deref(), argv, false, json)
-        }
-
         BrowserCommands::Take { session } => take(&root, session.as_deref()),
         BrowserCommands::Release { session } => release(&root, session.as_deref()),
         BrowserCommands::View {
@@ -2218,6 +2244,7 @@ fn start(
         },
         logs: spawned.logs.clone(),
         permissive_cors: opts.permissive_cors,
+        proxy: None,
     };
     bs::write(root, &session)?;
     // The default follows the newest session whether or not it was named, so a
@@ -2257,6 +2284,298 @@ fn start(
             None => String::new(),
         };
         println!("\n  next     : {}", style(format!("h5i browser snapshot{sel}")).dim());
+    }
+    Ok(())
+}
+
+/// Start the external-Chromium capture lane.
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+}
+
+fn proxy_agent_browser() -> anyhow::Result<PathBuf> {
+    let path = executable_on_path("agent-browser")
+        .or_else(|| h5i_core::sandbox::agent_browser_binary().map(PathBuf::from))
+        .ok_or_else(|| anyhow::anyhow!(
+            "`h5i browser proxy` needs agent-browser, but `agent-browser` was not found.\n\n  \
+             Install it and its Chromium/CA dependencies, then retry:\n    \
+             npm install -g agent-browser\n    \
+             agent-browser install --with-deps\n\n  \
+             Nothing was started. `h5i browser open <url>` remains available for direct capture."
+        ))?;
+    let version = Command::new(&path).arg("--version").output().map_err(|e| {
+        anyhow::anyhow!(
+            "found agent-browser at {}, but it could not be executed ({e}).\n\n  \
+             Repair or reinstall it, then retry. Nothing was started.",
+            path.display()
+        )
+    })?;
+    if !version.status.success() {
+        let detail = String::from_utf8_lossy(&version.stderr);
+        anyhow::bail!(
+            "found agent-browser at {}, but `agent-browser --version` exited with {}: {}\n\n  \
+             Repair or reinstall it, then retry. Nothing was started.",
+            path.display(),
+            version.status,
+            bs::scrub_text(detail.trim())
+        );
+    }
+    Ok(path)
+}
+
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Which Chromium acceptance mode this machine can actually use.
+///
+/// agent-browser's `--ca-cert` imports into an isolated NSS database, and that
+/// path exists only on Linux. macOS still gets a capture proxy; the printed
+/// command passes `--ignore-https-errors` instead of a CA.
+fn host_proxy_chromium_tls() -> anyhow::Result<bs::ChromiumTls> {
+    if cfg!(target_os = "linux") {
+        Ok(bs::ChromiumTls::SessionCa)
+    } else if cfg!(target_os = "macos") {
+        Ok(bs::ChromiumTls::IgnoreHttpsErrors)
+    } else {
+        anyhow::bail!(
+            "`h5i browser proxy` trusts its interception CA on Linux, and on macOS it prints an \
+             agent-browser command with `--ignore-https-errors`. This platform has neither, so \
+             nothing was started. Use `h5i browser open` here instead."
+        )
+    }
+}
+
+/// The shell line a person copies to point agent-browser at this proxy.
+fn agent_browser_open_line(
+    agent_browser: &str,
+    proxy_url: &str,
+    trust: bs::ChromiumTls,
+    ca_cert: &Path,
+    url: &str,
+) -> String {
+    let browser = shell_word(agent_browser);
+    let proxy = shell_word(proxy_url);
+    let target = shell_word(url);
+    match trust {
+        bs::ChromiumTls::SessionCa => format!(
+            "{browser} --proxy {proxy} --ca-cert {} open {target}",
+            shell_word(&ca_cert.to_string_lossy())
+        ),
+        bs::ChromiumTls::IgnoreHttpsErrors => {
+            format!("{browser} --proxy {proxy} --ignore-https-errors open {target}")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_proxy(
+    root: &Path,
+    url: String,
+    name: Option<String>,
+    project: Option<String>,
+    allow: Vec<String>,
+    no_loopback: bool,
+    expires_in: Option<u64>,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let trust = host_proxy_chromium_tls()?;
+    if !is_web_url(&url) {
+        anyhow::bail!("`browser proxy` needs an http:// or https:// target, not {url:?}");
+    }
+    // Do every external-tool check before allocating a session id, creating a
+    // CA, or spawning the proxy. A missing browser must leave no half-session.
+    let agent_browser = proxy_agent_browser()?;
+    if trust == bs::ChromiumTls::SessionCa && executable_on_path("certutil").is_none() {
+        anyhow::bail!(
+            "`h5i browser proxy` needs `certutil` so agent-browser can trust the per-session \
+             interception CA, but it was not found on PATH.\n\n  Install the browser dependencies, \
+             then retry:\n    agent-browser install --with-deps\n\n  On Debian/Ubuntu you can \
+             instead install `libnss3-tools`; on RPM Linux, install `nss-tools`. Nothing was started."
+        );
+    }
+    if let Some(name) = &name
+        && let Some(existing) = bs::find_by_name(root, name)
+    {
+        anyhow::bail!(
+            "browser session `{name}` is already open as {}. Close it first or choose another name.",
+            existing.id
+        );
+    }
+    let scope = match &project {
+        Some(name) => crate::cli::scope::resolve(name)?,
+        None => None,
+    };
+    let id = bs::new_id(root)?;
+    let dir = bs::dir(root, &id);
+    let control = dir.join(bs::CONTROL_FILE);
+    let stream = dir.join(bs::STREAM_FILE);
+    let proxy_file = dir.join("proxy");
+    let ca_cert = dir.join("proxy-ca.pem");
+    let ca_key = dir.join("proxy-ca-key.pem");
+    let log_path = dir.join("proxy.log");
+
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("__capture-proxy")
+        .arg("--target")
+        .arg(&url)
+        .arg("--control-file")
+        .arg(&control)
+        .arg("--stream-file")
+        .arg(&stream)
+        .arg("--proxy-file")
+        .arg(&proxy_file)
+        .arg("--ca-cert")
+        .arg(&ca_cert)
+        .arg("--ca-key")
+        .arg(&ca_key)
+        .arg("--receipts")
+        .arg(dir.join(bs::RECEIPTS_FILE))
+        .arg("--actions")
+        .arg(dir.join(bs::ACTIONS_FILE))
+        .arg("--messages")
+        .arg(dir.join(bs::MESSAGES_DIR))
+        .arg("--allow")
+        .arg(&url);
+    for origin in allow {
+        command.arg("--allow").arg(origin);
+    }
+    if let Some(scope) = &scope {
+        command.args(scope.engine_args());
+    }
+    if no_loopback {
+        command.arg("--no-loopback");
+    }
+    let log = std::fs::File::create(&log_path)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
+    detach(&mut command);
+    let mut child = command.spawn().map_err(|e| anyhow::anyhow!(
+        "could not start the Chromium capture proxy ({e})"
+    ))?;
+    let pid = child.id();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !(control.is_file() && proxy_file.is_file() && ca_cert.is_file()) {
+        if let Some(status) = child.try_wait()? {
+            let why = std::fs::read_to_string(&log_path).unwrap_or_default();
+            anyhow::bail!(
+                "the Chromium capture proxy exited with {status}: {}",
+                bs::scrub_text(why.trim())
+            );
+        }
+        if Instant::now() >= deadline {
+            kill(pid);
+            anyhow::bail!("the Chromium capture proxy did not become ready within 15 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let proxy_url = std::fs::read_to_string(&proxy_file)?.trim().to_string();
+    let opts = StartOptions {
+        url: url.clone(),
+        project: project.clone(),
+        scope: scope.clone(),
+        in_box: None,
+        allow: Vec::new(),
+        no_loopback,
+        script: false,
+        permissive_cors: false,
+        no_sandbox: true,
+        secrets: Vec::new(),
+        #[cfg(feature = "identity")]
+        identity: DEFAULT_IDENTITY.to_string(),
+        width: 0,
+        height: 0,
+        expires_in,
+        restore: None,
+        cookie_jar: None,
+        capture: true,
+        script_seconds: None,
+    };
+    let session = bs::Session {
+        id: id.clone(),
+        name: name.clone(),
+        project,
+        engine: bs::Engine::Chromium,
+        placement: bs::Placement::Host,
+        lane: bs::Lane::ProxyObserved,
+        url: url.clone(),
+        started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        expires_at: expires_in.map(|secs| {
+            (chrono::Utc::now() + chrono::Duration::seconds(secs as i64))
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        }),
+        storage: bs::Storage::Ephemeral,
+        policy_digest: host_policy_digest(&opts),
+        scope_digest: scope.as_ref().map(|s| s.digest.clone()).unwrap_or_default(),
+        identity: "agent-browser/chromium".into(),
+        identity_digest: String::new(),
+        restored_from: None,
+        state: bs::State::Live,
+        ended_at: None,
+        end_reason: None,
+        confinement: h5i_core::browser_sandbox::Confinement::None {
+            why: "agent-browser and Chromium run as ordinary host processes".into(),
+        },
+        enclosing_box: None,
+        control: bs::Control {
+            channel: bs::Channel::Port,
+            file: Some(control),
+            witness: Some(proxy_file),
+            pid: Some(pid),
+        },
+        logs: bs::Logs {
+            actions: Some(dir.join(bs::ACTIONS_FILE)),
+            requests: Some(dir.join(bs::RECEIPTS_FILE)),
+        },
+        permissive_cors: false,
+        proxy: Some(bs::Proxy {
+            url: proxy_url.clone(),
+            ca_cert: ca_cert.clone(),
+            chromium_tls: trust,
+        }),
+    };
+    bs::write(root, &session)?;
+    bs::set_default(root, &id)?;
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&session)?);
+    } else {
+        println!("{} Chromium capture session {}", SUCCESS, label(&session));
+        print_summary(&session);
+        println!("  proxy    : {proxy_url}");
+        match trust {
+            bs::ChromiumTls::SessionCa => {
+                println!("  CA       : {}", ca_cert.display());
+            }
+            bs::ChromiumTls::IgnoreHttpsErrors => {
+                println!(
+                    "  tls      : {} — macOS cannot install the session CA, so the printed \
+                     command tells Chromium to accept every certificate error for that launch",
+                    style("ignore-https-errors").yellow()
+                );
+            }
+        }
+        println!();
+        println!(
+            "  start    : {}",
+            agent_browser_open_line(
+                &agent_browser.to_string_lossy(),
+                &proxy_url,
+                trust,
+                &ca_cert,
+                &url
+            )
+        );
+        println!("  login    : agent-browser dashboard start");
+        println!("  inspect  : h5i websec requests");
     }
     Ok(())
 }
@@ -4609,6 +4928,7 @@ fn print_summary(session: &bs::Session) {
     let lane = match session.lane {
         bs::Lane::EngineClaimed => style("engine-claimed").yellow(),
         bs::Lane::HostObserved => style("host-observed").green(),
+        bs::Lane::ProxyObserved => style("proxy-observed").green(),
     };
     println!(
         "  requests : {} ({})",
@@ -4617,8 +4937,21 @@ fn print_summary(session: &bs::Session) {
             bs::Lane::EngineClaimed =>
                 "fail-closed, and the engine's own account of what it fetched",
             bs::Lane::HostObserved => "also seen at the box's boundary, outside the engine",
+            bs::Lane::ProxyObserved => {
+                "captured at h5i's proxy; the external browser itself is not confined"
+            }
         }
     );
+    if session
+        .proxy
+        .as_ref()
+        .is_some_and(|proxy| proxy.chromium_tls == bs::ChromiumTls::IgnoreHttpsErrors)
+    {
+        println!(
+            "  tls      : {} — Chromium accepts every certificate error for this session",
+            style("ignore-https-errors").yellow()
+        );
+    }
     if let Some(project) = &session.project {
         println!("  project  : {project}");
     }
@@ -5311,6 +5644,67 @@ mod tests {
             loading.contains("h5i browser read"),
             "and what to do instead: {loading}"
         );
+    }
+
+    #[test]
+    fn the_printed_agent_browser_line_trusts_only_the_session_ca_on_linux() {
+        let line = agent_browser_open_line(
+            "/usr/bin/agent-browser",
+            "http://127.0.0.1:9",
+            bs::ChromiumTls::SessionCa,
+            Path::new("/tmp/proxy-ca.pem"),
+            "https://app.example/a b",
+        );
+        assert_eq!(
+            line,
+            "'/usr/bin/agent-browser' --proxy 'http://127.0.0.1:9' --ca-cert '/tmp/proxy-ca.pem' open 'https://app.example/a b'"
+        );
+    }
+
+    #[test]
+    fn the_printed_agent_browser_line_ignores_https_errors_on_macos() {
+        let line = agent_browser_open_line(
+            "agent-browser",
+            "http://127.0.0.1:9",
+            bs::ChromiumTls::IgnoreHttpsErrors,
+            Path::new("/tmp/proxy-ca.pem"),
+            "https://app.example",
+        );
+        assert_eq!(
+            line,
+            "'agent-browser' --proxy 'http://127.0.0.1:9' --ignore-https-errors open 'https://app.example'"
+        );
+        assert!(
+            !line.contains("ca-cert"),
+            "macOS must not be handed a CA flag agent-browser rejects: {line}"
+        );
+    }
+
+    #[test]
+    fn an_older_proxy_record_without_chromium_tls_means_the_session_ca() {
+        let proxy: bs::Proxy =
+            serde_json::from_str(r#"{"url":"http://127.0.0.1:9","ca_cert":"/tmp/ca.pem"}"#)
+                .expect("old record");
+        assert_eq!(proxy.chromium_tls, bs::ChromiumTls::SessionCa);
+    }
+
+    #[test]
+    fn this_host_selects_the_chromium_trust_it_can_install() {
+        let trust = host_proxy_chromium_tls();
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                trust.expect("linux installs the session CA"),
+                bs::ChromiumTls::SessionCa
+            );
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(
+                trust.expect("macOS prints --ignore-https-errors"),
+                bs::ChromiumTls::IgnoreHttpsErrors
+            );
+        } else {
+            let error = trust.expect_err("other platforms refuse before a session exists");
+            assert!(error.to_string().contains("nothing was started"), "{error}");
+        }
     }
 
     #[test]
