@@ -1,12 +1,14 @@
 //! The Chromium lane: an h5i-owned intercepting proxy writing the ordinary
 //! browser receipt and message-store formats.
 
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use clap::Parser;
 use h5i_browser::capture::{Capture, Received};
+use h5i_browser::dom_inject;
 use h5i_browser::net::{LocalBroker, ProxyResponse};
 use h5i_browser::receipt::JsonlSink;
 use http_body_util::BodyExt as _;
@@ -47,6 +49,10 @@ pub struct Args {
     pub deny_path: Vec<String>,
     #[arg(long)]
     pub no_loopback: bool,
+    /// Turn on DOM instrumentation: inject the instrument into HTML responses
+    /// and append the reports it beacons back to this file, one JSON per line.
+    #[arg(long = "dom-report", value_name = "PATH")]
+    pub dom_report: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -54,6 +60,23 @@ struct Handler {
     broker: Arc<LocalBroker>,
     request: Option<h5i_browser::RequestRecord>,
     started: Option<Instant>,
+    /// Set together when DOM instrumentation is on: the script to inject, and
+    /// the file the injected script's reports are appended to.
+    instrument: Option<Arc<str>>,
+    dom_report: Option<Arc<Mutex<std::fs::File>>>,
+}
+
+/// The host and path of a request, for matching the instrument's report beacon.
+/// The authority rides in the URI or, in origin-form, the Host header.
+fn host_and_path(parts: &hudsucker::hyper::http::request::Parts) -> (Option<String>, String) {
+    let host = parts.uri.host().map(str::to_string).or_else(|| {
+        parts
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(|h| h.split(':').next().unwrap_or(h).to_string())
+    });
+    (host, parts.uri.path().to_string())
 }
 
 fn headers<T>(
@@ -99,6 +122,31 @@ impl HttpHandler for Handler {
             return req.into();
         }
         let (parts, body) = req.into_parts();
+        // The instrument's report beacon: swallow it here, before policy and
+        // before it is recorded, and answer 204. It never reaches upstream (the
+        // host does not resolve) and must never land in the capture store.
+        if let Some(report) = &self.dom_report {
+            let (host, path) = host_and_path(&parts);
+            if host.as_deref() == Some(dom_inject::BEACON_HOST) && path == dom_inject::BEACON_PATH {
+                // The report is a single small JSON line. Bound the read so page
+                // script cannot POST an unbounded body to this pre-policy
+                // endpoint; an oversized beacon is dropped, not buffered whole.
+                const BEACON_MAX: usize = 1 << 20;
+                if let Ok(collected) = http_body_util::Limited::new(body, BEACON_MAX).collect().await {
+                    let mut line = collected.to_bytes().to_vec();
+                    line.push(b'\n');
+                    if let Ok(mut file) = report.lock() {
+                        let _ = file.write_all(&line);
+                        let _ = file.flush();
+                    }
+                }
+                return Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(Body::empty())
+                    .expect("static proxy response")
+                    .into();
+            }
+        }
         let method = parts.method.as_str().to_string();
         let url = parts.uri.to_string();
         let sent_headers = headers(&parts, &());
@@ -187,6 +235,38 @@ impl HttpHandler for Handler {
                 },
             );
         }
+        // Inject the instrument into HTML responses, after the capture above has
+        // already recorded the original wire bytes. We serve identity: decode,
+        // inject, and drop the framing headers so hyper re-frames the new body.
+        if let Some(instrument) = &self.instrument {
+            let is_html = parts
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/html"));
+            // Only a full HTML document with a body. 204/205 must carry none,
+            // and a 206 range would be spliced mid-stream with a now-wrong
+            // Content-Range, so an empty body or either status is left alone.
+            let injectable = is_html
+                && !body.is_empty()
+                && status != 206
+                && (200..300).contains(&status);
+            if injectable {
+                let encoding = parts
+                    .headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok());
+                if let Some(decoded) = dom_inject::decode_body(&body, encoding) {
+                    let js: &str = instrument;
+                    let injected = dom_inject::inject_script(&decoded, js);
+                    let mut parts = parts;
+                    parts.headers.remove("content-encoding");
+                    parts.headers.remove("content-length");
+                    parts.headers.remove("transfer-encoding");
+                    return Response::from_parts(parts, Body::from(injected));
+                }
+            }
+        }
         Response::from_parts(parts, Body::from(body))
     }
 
@@ -249,6 +329,33 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         Some(capture),
     )?;
 
+    // DOM instrumentation is on exactly when a report file is named. Create it
+    // now so the file's presence tells `websec dom scan` the session is armed.
+    let (instrument, dom_report) = match &args.dom_report {
+        Some(path) => {
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            // Owner-only: the reports carry sampled target page content, like
+            // the capture store and findings, so they never land world-readable.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let file = options.open(path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            (
+                Some(Arc::<str>::from(dom_inject::render_instrument())),
+                Some(Arc::new(Mutex::new(file))),
+            )
+        }
+        None => (None, None),
+    };
+
     let issuer = make_ca(&args.ca_cert, &args.ca_key)?;
     let ca = RcgenAuthority::new(issuer, 1_000, aws_lc_rs::default_provider());
     let proxy_file = args.proxy_file.clone();
@@ -271,6 +378,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                         broker: proxy_broker,
                         request: None,
                         started: None,
+                        instrument,
+                        dom_report,
                     })
                     .build()?;
                 proxy.start().await.map_err(anyhow::Error::from)

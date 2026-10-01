@@ -101,11 +101,11 @@ pub enum BrowserCommands {
     /// Capture an external Chromium session through an h5i HTTP/S proxy.
     ///
     /// The command starts a resident session and prints the exact
-    /// `agent-browser` flags for it. On Linux those flags trust this session's
-    /// CA. On macOS they pass `--ignore-https-errors`, because agent-browser
-    /// cannot install a CA there and Chromium then accepts every certificate
-    /// error for that launch. Chromium remains agent-browser's; h5i owns
-    /// policy, capture, replay and evidence.
+    /// `agent-browser` flags for it. agent-browser exposes no single-CA trust
+    /// flag, so the flags pass `--ignore-https-errors` (Chromium accepts the
+    /// proxy's forged certs for that launch) on every platform; the session CA
+    /// is still written for anyone who prefers to install it. Chromium remains
+    /// agent-browser's; h5i owns policy, capture, replay and evidence.
     Proxy {
         /// The first target, used to seed the origin allowlist.
         url: String,
@@ -124,7 +124,29 @@ pub enum BrowserCommands {
         /// End the proxy automatically after this many seconds.
         #[arg(long, value_name = "SECONDS")]
         expires_in: Option<u64>,
+        /// Instrument pages for prototype pollution and DOM-XSS: inject the DOM
+        /// instrument into HTML and collect what reaches a sink, for
+        /// `h5i websec dom scan`.
+        #[arg(long = "dom-instrument")]
+        dom_instrument: bool,
         /// Print the session record as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Open a URL in the Chromium a `proxy` session drives.
+    ///
+    /// Launches (or reuses) agent-browser pointed at the session's capture
+    /// proxy, so the page is fetched through h5i and, when the session was
+    /// armed with `--dom-instrument`, the DOM instrument runs. `h5i websec dom
+    /// scan` drives its probes this way; a person can call it directly too.
+    ProxyOpen {
+        /// The URL to open.
+        url: String,
+        /// The proxy session to drive.
+        #[arg(long, short = 's', value_name = "NAME")]
+        session: Option<String>,
+        /// Print the result as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -1305,6 +1327,7 @@ pub fn run(action: BrowserCommands) -> anyhow::Result<()> {
             allow,
             no_loopback,
             expires_in,
+            dom_instrument,
             json,
         } => start_proxy(
             &root,
@@ -1314,8 +1337,12 @@ pub fn run(action: BrowserCommands) -> anyhow::Result<()> {
             allow,
             no_loopback,
             expires_in,
+            dom_instrument,
             json,
         ),
+        BrowserCommands::ProxyOpen { url, session, json } => {
+            proxy_open(&root, url, session, json)
+        }
         BrowserCommands::Open {
             url,
             session,
@@ -2409,45 +2436,66 @@ fn shell_word(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Which Chromium acceptance mode this machine can actually use.
+/// Quote a word for a copy-paste shell line only when it needs it, so plain
+/// flags like `--proxy` stay readable and only args with shell metacharacters
+/// (spaces, `<`, `>`, …) are quoted.
+fn shell_word_if_needed(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b':' | b'=' | b'-' | b'+' | b'@' | b'%' | b',')
+        });
+    if safe {
+        value.to_string()
+    } else {
+        shell_word(value)
+    }
+}
+
+/// Whether this machine can drive a proxied Chromium at all.
 ///
-/// agent-browser's `--ca-cert` imports into an isolated NSS database, and that
-/// path exists only on Linux. macOS still gets a capture proxy; the printed
-/// command passes `--ignore-https-errors` instead of a CA.
+/// Both Linux and macOS point agent-browser at the proxy and tell Chromium to
+/// accept the forged certs. agent-browser (as of 0.27) exposes no flag to trust
+/// a single CA, so `--ignore-https-errors` is the one mechanism it does offer,
+/// and for a local interception proxy on an authorized target it is the right
+/// one. The CA file is still written for anyone who prefers to install it.
 fn host_proxy_chromium_tls() -> anyhow::Result<bs::ChromiumTls> {
-    if cfg!(target_os = "linux") {
-        Ok(bs::ChromiumTls::SessionCa)
-    } else if cfg!(target_os = "macos") {
+    if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
         Ok(bs::ChromiumTls::IgnoreHttpsErrors)
     } else {
         anyhow::bail!(
-            "`h5i browser proxy` trusts its interception CA on Linux, and on macOS it prints an \
-             agent-browser command with `--ignore-https-errors`. This platform has neither, so \
-             nothing was started. Use `h5i browser open` here instead."
+            "`h5i browser proxy` drives a proxied Chromium on Linux and macOS. This platform is \
+             neither, so nothing was started. Use `h5i browser open` here instead."
         )
     }
 }
 
+/// The agent-browser arguments that point it at this proxy and let it reach the
+/// target. `--ignore-https-errors` accepts the proxy's forged certs (including
+/// the one for the instrument's report beacon); `--proxy-bypass-list=<-loopback>`
+/// stops Chromium bypassing the proxy for localhost, which it does by default
+/// and which otherwise hides a dev-server target from capture entirely.
+fn agent_browser_proxy_args(proxy_url: &str) -> Vec<String> {
+    vec![
+        "--proxy".into(),
+        proxy_url.into(),
+        "--ignore-https-errors".into(),
+        "--args".into(),
+        "--proxy-bypass-list=<-loopback>".into(),
+    ]
+}
+
 /// The shell line a person copies to point agent-browser at this proxy.
-fn agent_browser_open_line(
-    agent_browser: &str,
-    proxy_url: &str,
-    trust: bs::ChromiumTls,
-    ca_cert: &Path,
-    url: &str,
-) -> String {
-    let browser = shell_word(agent_browser);
-    let proxy = shell_word(proxy_url);
-    let target = shell_word(url);
-    match trust {
-        bs::ChromiumTls::SessionCa => format!(
-            "{browser} --proxy {proxy} --ca-cert {} open {target}",
-            shell_word(&ca_cert.to_string_lossy())
-        ),
-        bs::ChromiumTls::IgnoreHttpsErrors => {
-            format!("{browser} --proxy {proxy} --ignore-https-errors open {target}")
-        }
-    }
+fn agent_browser_open_line(agent_browser: &str, proxy_url: &str, url: &str) -> String {
+    let flags = agent_browser_proxy_args(proxy_url)
+        .iter()
+        .map(|a| shell_word_if_needed(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{} {flags} open {}",
+        shell_word_if_needed(agent_browser),
+        shell_word_if_needed(url)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2459,6 +2507,7 @@ fn start_proxy(
     allow: Vec<String>,
     no_loopback: bool,
     expires_in: Option<u64>,
+    dom_instrument: bool,
     json_out: bool,
 ) -> anyhow::Result<()> {
     let trust = host_proxy_chromium_tls()?;
@@ -2468,14 +2517,6 @@ fn start_proxy(
     // Do every external-tool check before allocating a session id, creating a
     // CA, or spawning the proxy. A missing browser must leave no half-session.
     let agent_browser = proxy_agent_browser()?;
-    if trust == bs::ChromiumTls::SessionCa && executable_on_path("certutil").is_none() {
-        anyhow::bail!(
-            "`h5i browser proxy` needs `certutil` so agent-browser can trust the per-session \
-             interception CA, but it was not found on PATH.\n\n  Install the browser dependencies, \
-             then retry:\n    agent-browser install --with-deps\n\n  On Debian/Ubuntu you can \
-             instead install `libnss3-tools`; on RPM Linux, install `nss-tools`. Nothing was started."
-        );
-    }
     if let Some(name) = &name
         && let Some(existing) = bs::find_by_name(root, name)
     {
@@ -2528,6 +2569,9 @@ fn start_proxy(
     }
     if no_loopback {
         command.arg("--no-loopback");
+    }
+    if dom_instrument {
+        command.arg("--dom-report").arg(dir.join("dom-report.jsonl"));
     }
     let log = std::fs::File::create(&log_path)?;
     command
@@ -2629,31 +2673,85 @@ fn start_proxy(
         println!("{} Chromium capture session {}", SUCCESS, label(&session));
         print_summary(&session);
         println!("  proxy    : {proxy_url}");
-        match trust {
-            bs::ChromiumTls::SessionCa => {
-                println!("  CA       : {}", ca_cert.display());
-            }
-            bs::ChromiumTls::IgnoreHttpsErrors => {
-                println!(
-                    "  tls      : {} — macOS cannot install the session CA, so the printed \
-                     command tells Chromium to accept every certificate error for that launch",
-                    style("ignore-https-errors").yellow()
-                );
-            }
-        }
+        println!(
+            "  tls      : {} — the printed command tells Chromium to accept the proxy's forged \
+             certificates for that launch",
+            style("ignore-https-errors").yellow()
+        );
+        println!("  CA       : {} (install it yourself to avoid the flag)", ca_cert.display());
         println!();
         println!(
             "  start    : {}",
-            agent_browser_open_line(
-                &agent_browser.to_string_lossy(),
-                &proxy_url,
-                trust,
-                &ca_cert,
-                &url
-            )
+            agent_browser_open_line(&agent_browser.to_string_lossy(), &proxy_url, &url)
         );
         println!("  login    : agent-browser dashboard start");
         println!("  inspect  : h5i websec requests");
+    }
+    Ok(())
+}
+
+/// The agent-browser session name a proxy session's `proxy-open` drives.
+fn proxy_browser_session(id: &str) -> String {
+    format!("h5i-{id}")
+}
+
+/// Best-effort shutdown of the agent-browser daemon `proxy-open` started for a
+/// session. Nothing else reaps it, so closing the h5i session must, or a scan
+/// leaves a headless Chromium resident.
+fn close_proxy_browser(id: &str) {
+    if let Some(agent_browser) = executable_on_path("agent-browser") {
+        let _ = Command::new(agent_browser)
+            .arg("--session")
+            .arg(proxy_browser_session(id))
+            .arg("close")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Drive the agent-browser Chromium of a proxy session to a URL.
+fn proxy_open(
+    root: &Path,
+    url: String,
+    session: Option<String>,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let s = bs::resolve(root, session.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let proxy = s.proxy.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "session {} is not a proxy session; start one with `h5i browser proxy <url>`",
+            s.id
+        )
+    })?;
+    let agent_browser = proxy_agent_browser()?;
+    // One agent-browser browser per h5i session, so repeated opens reuse it.
+    let ab_session = proxy_browser_session(&s.id);
+    let output = Command::new(&agent_browser)
+        .arg("--session")
+        .arg(&ab_session)
+        .args(agent_browser_proxy_args(&proxy.url))
+        .arg("open")
+        .arg(&url)
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run agent-browser: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "agent-browser could not open {url}: {}",
+            bs::scrub_text(stderr.trim())
+        );
+    }
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true, "session": s.id, "url": url,
+            }))?
+        );
+    } else {
+        println!("{} opened {url} through session {}", SUCCESS, s.id);
     }
     Ok(())
 }
@@ -5127,6 +5225,11 @@ fn close(
     for mut session in targets {
         if session.state.is_live() {
             stop_engine(&session)?;
+            // A proxy session may have an agent-browser daemon from proxy-open;
+            // stop_engine only killed the h5i proxy, so reap that browser too.
+            if session.proxy.is_some() {
+                close_proxy_browser(&session.id);
+            }
             bs::end(root, &mut session, bs::State::Closed, "closed by the user");
         }
         // After the engine has stopped, so nothing is still writing there.
@@ -5748,37 +5851,18 @@ mod tests {
     }
 
     #[test]
-    fn the_printed_agent_browser_line_trusts_only_the_session_ca_on_linux() {
+    fn the_printed_agent_browser_line_accepts_forged_certs_and_keeps_loopback() {
         let line = agent_browser_open_line(
             "/usr/bin/agent-browser",
             "http://127.0.0.1:9",
-            bs::ChromiumTls::SessionCa,
-            Path::new("/tmp/proxy-ca.pem"),
             "https://app.example/a b",
         );
         assert_eq!(
             line,
-            "'/usr/bin/agent-browser' --proxy 'http://127.0.0.1:9' --ca-cert '/tmp/proxy-ca.pem' open 'https://app.example/a b'"
+            "/usr/bin/agent-browser --proxy http://127.0.0.1:9 --ignore-https-errors --args '--proxy-bypass-list=<-loopback>' open 'https://app.example/a b'"
         );
-    }
-
-    #[test]
-    fn the_printed_agent_browser_line_ignores_https_errors_on_macos() {
-        let line = agent_browser_open_line(
-            "agent-browser",
-            "http://127.0.0.1:9",
-            bs::ChromiumTls::IgnoreHttpsErrors,
-            Path::new("/tmp/proxy-ca.pem"),
-            "https://app.example",
-        );
-        assert_eq!(
-            line,
-            "'agent-browser' --proxy 'http://127.0.0.1:9' --ignore-https-errors open 'https://app.example'"
-        );
-        assert!(
-            !line.contains("ca-cert"),
-            "macOS must not be handed a CA flag agent-browser rejects: {line}"
-        );
+        // agent-browser 0.27 has no CA-trust flag; it must never be handed one.
+        assert!(!line.contains("ca-cert"), "{line}");
     }
 
     #[test]
@@ -5792,14 +5876,9 @@ mod tests {
     #[test]
     fn this_host_selects_the_chromium_trust_it_can_install() {
         let trust = host_proxy_chromium_tls();
-        if cfg!(target_os = "linux") {
+        if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
             assert_eq!(
-                trust.expect("linux installs the session CA"),
-                bs::ChromiumTls::SessionCa
-            );
-        } else if cfg!(target_os = "macos") {
-            assert_eq!(
-                trust.expect("macOS prints --ignore-https-errors"),
+                trust.expect("linux and macOS drive a proxied Chromium"),
                 bs::ChromiumTls::IgnoreHttpsErrors
             );
         } else {

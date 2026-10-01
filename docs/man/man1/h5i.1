@@ -963,7 +963,7 @@ Capture an external Chromium session through an h5i HTTP/S proxy
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .SS SYNOPSIS
-\fBproxy\fR [\fB\-s\fR|\fB\-\-session\fR] [\fB\-\-project\fR] [\fB\-\-allow\fR] [\fB\-\-no\-loopback\fR] [\fB\-\-expires\-in\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIURL\fR> 
+\fBproxy\fR [\fB\-s\fR|\fB\-\-session\fR] [\fB\-\-project\fR] [\fB\-\-allow\fR] [\fB\-\-no\-loopback\fR] [\fB\-\-expires\-in\fR] [\fB\-\-dom\-instrument\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIURL\fR> 
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .SS OPTIONS
@@ -983,6 +983,9 @@ Refuse loopback too
 \fB\-\-expires\-in\fR \fI<SECONDS>\fR
 End the proxy automatically after this many seconds
 .TP
+\fB\-\-dom\-instrument\fR
+Instrument pages for prototype pollution and DOM\-XSS: inject the DOM instrument into HTML and collect what reaches a sink, for `h5i websec dom scan`
+.TP
 \fB\-\-json\fR
 Print the session record as JSON
 .TP
@@ -991,6 +994,27 @@ Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fIURL\fR>
 The first target, used to seed the origin allowlist
+.SH "H5I BROWSER PROXY-OPEN"
+Open a URL in the Chromium a `proxy` session drives
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SS SYNOPSIS
+\fBproxy\-open\fR [\fB\-s\fR|\fB\-\-session\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIURL\fR> 
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SS OPTIONS
+.TP
+\fB\-s\fR, \fB\-\-session\fR \fI<NAME>\fR
+The proxy session to drive
+.TP
+\fB\-\-json\fR
+Print the result as JSON
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIURL\fR>
+The URL to open
 .SH "H5I BROWSER OPEN"
 Open a URL, making a session if there is not one already
 .ie \n(.g .ds Aq \(aq
